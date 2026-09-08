@@ -25229,6 +25229,15 @@ class EarlyAnalysisGate:
                 except Exception:
                     _depth = 0
                 pct = self.spread.percentile(spr) if _depth >= 30 else 0.5
+                # Zero-variance neutrality: a stuck/constant spread (fixed-spread
+                # broker feed, backtest estimate) has no distribution to be
+                # extreme IN — no opinion instead of a permanent veto.
+                try:
+                    _w = list(self.spread.window)
+                    if _w and (max(_w) - min(_w)) <= 1e-12:
+                        pct = 0.5
+                except Exception:
+                    pass
             else:
                 pct = 0.5
             verdict["spread_pctile"] = float(pct)
@@ -31384,7 +31393,7 @@ class AdaptiveDivergenceSniper(_L2Base):
                 tp_atr = qclip(quantum_expected_r(feats, side), 1.2, 5.0)
             except Exception:
                 conf, tp_atr = 0.6, sl_atr * 1.6
-            return self._sig(side, conf, sl_atr, tp_atr, f"div{divs:+d} rsi{rsi:.0f}")
+            return self._sig(side, conf, sl_atr, tp_atr, f"div{int(divs):+d} rsi{rsi:.0f}")
         except Exception:
             return self._sig(reason="error")
 
@@ -32808,7 +32817,7 @@ class DivergenceEntryValidator:
             rsi = ind.get("rsi", 50)
             side = -qsign(divs)  # bearish div => short
             # Witness 1: divergence present
-            out["witnesses"].append(f"div{divs:+d}")
+            out["witnesses"].append(f"div{int(divs):+d}")
             # Witness 2: RSI in the right quantile zone
             if side < 0 and rsi >= ind.get("rsi_hi", 70):
                 out["witnesses"].append(f"rsi{rsi:.0f}_ob")
@@ -33028,14 +33037,14 @@ def quantum_signal(tf_dfs, ctx=None, exec_tf="M15", symbol="XAUUSD",
             return EntryTicket(veto="no_strategy", chain=chain, regime=regime,
                                session=session)
         s = sigs[0]
-        chain.append(f"l2:{s.get('strategy')}:{s.get('side'):+d}@{s.get('conf', 0):.2f}")
+        chain.append(f"l2:{s.get('strategy')}:{int(s.get('side', 0)):+d}@{s.get('conf', 0):.2f}")
         # HTF permission check
         if perm != 0 and qsign(s.get("side", 0)) != perm:
             # Allow counter-HTF only for mean-reversion with high conf
             if not (s.get("strategy") == "swing_catcher" and s.get("conf", 0) > 0.7):
                 return EntryTicket(veto="htf_permission", chain=chain, regime=regime,
                                    session=session)
-        chain.append(f"perm:{perm:+d}_ok")
+        chain.append(f"perm:{int(perm):+d}_ok")
         # Fuse
         fuse = quantum_fuse(s.get("strategy"), s.get("side"), regime, bar_no)
         chain.append(f"fuse:{fuse.get('reason')}")
@@ -39782,3 +39791,521 @@ def quantum_epilogue():
 
 
 SECTION_EPILOGUE_OK = True
+
+# ============================================================================
+# ANNALS — BUILD JOURNAL (why every section exists, what evidence backs it)
+# ----------------------------------------------------------------------------
+# Each entry: section, the problem it solves, the evidence/lineage, and the
+# failure mode it guards. Read this before modifying anything — the annals
+# are the institutional memory of every design decision in the quantum core.
+# ============================================================================
+
+QUANTUM_ANNALS = (
+    ("E0 outcome ledger", "Fills arrived unattributed; no one knew what worked.",
+     "Phase-BCD autopsy: XAU bled while BTC 1h edged — attribution is survival.",
+     "Guards: narrative fallacy, strategy amnesia."),
+    ("E1 decision log", "Decisions evaporated; journals disagreed with memory.",
+     "Lineage: v12 83-column telemetry, made immutable and queryable.",
+     "Guards: hindsight editing, missing post-mortems."),
+    ("E2 pattern miner", "Setups were asserted, never discovered.",
+     "Lineage: Phase-D regime splits showed edges hide in slices.",
+     "Guards: fooled-by-randomness, fixed-pattern dogma."),
+    ("E3 param evolution", "Hand-tuned params rotted silently.",
+     "Evidence: fixed 14/26/50/200 failed across regimes in every backtest.",
+     "Guards: numerology, parameter rot."),
+    ("E4 feedback loop", "Outcomes never rewrote priors.",
+     "Lineage: Bayesian updating; the bot must change its mind with data.",
+     "Guards: static beliefs, ignoring losses."),
+    ("E5 calibrated ensemble", "Confidences were hand-scored fiction.",
+     "Evidence: v12 conf = 0.6 + (adx-25)/30 — uncalibrated by construction.",
+     "Guards: overconfidence, mis-sized conviction."),
+    ("E6 narrative+preflight", "No story, no early veto — surprises only.",
+     "Lineage: operator request (narrative + pre-flight analysis).",
+     "Guards: black-box trading, late vetoes."),
+    ("E7 walkforward+conformal", "Backtests lied with in-sample pride.",
+     "Evidence: BTC edge survived walk-forward; XAU's didn't. Truth filter.",
+     "Guards: overfit, lucky windows."),
+    ("E8 meta-learning", "One calibration for all regimes lied everywhere.",
+     "Lineage: per-regime reliability tables + ADWIN drift literature.",
+     "Guards: regime-blind probs, undetected decay."),
+    ("F1 pine parity", "278 pine signals stranded in TradingView.",
+     "Lineage: OMNI-GOD-UNIFIED pine, ported as features not gospel.",
+     "Guards: rewrite-from-zero waste, pine lock-in."),
+    ("F2 structure", "Entries floated without structure.",
+     "Lineage: BOS/zone literature + v12 zone engine, quantile-armed.",
+     "Guards: mid-nowhere entries, arbitrary S/R."),
+    ("F3 ICT+gangs", "Liquidity behavior unmeasured.",
+     "Lineage: ICT concepts operationalized as testable statistics.",
+     "Guards: ICT mysticism, untested sweep entries."),
+    ("F4 chart patterns", "Classic patterns eyeballed, never scored.",
+     "Lineage: Bulkowski-style statistics, rolling-window fit.",
+     "Guards: pattern pareidolia, fixed-shape dogma."),
+    ("F5 20 systems", "Single-indicator fragility.",
+     "Evidence: ensemble disagreement predicts failure (Phase-D).",
+     "Guards: indicator worship, single-point failure."),
+    ("G deflated stats", "Sharpe lied under multiple testing.",
+     "Lineage: Bailey/Lopez de Prado deflated Sharpe + SPA.",
+     "Guards: backtest overfit, strategy mining luck."),
+    ("G2 forensics+exits", "Nobody knew WHY a ticket fired or where exits came from.",
+     "Lineage: Shapley values + conformal prediction literature.",
+     "Guards: unexplainable AI, fixed-multiple exits."),
+    ("H regime intel", "One strategy for all weather lost in all weather.",
+     "Evidence: BTC edge was regime-specific (Phase-BCD).",
+     "Guards: regime blindness, all-weather delusion."),
+    ("O adaptive indicators", "RSI 30/70 meant nothing on XAU M5.",
+     "Evidence: fixed thresholds failed every symbol except by luck.",
+     "Guards: magic numbers, cross-symbol blindness."),
+    ("O2 microstructure", "Spread/vol treated as constants.",
+     "Lineage: GK/YZ estimators, Amihud/Kyle, VPIN literature.",
+     "Guards: spread shocks, toxicity blindness."),
+    ("I execution base", "Fills assumed perfect.",
+     "Lineage: crypto-harness fetch/cache discipline.",
+     "Guards: stale ticks, unlogged spreads."),
+    ("I2 institutional exec", "Size moved the book against us.",
+     "Lineage: TWAP/VWAP/POV + Almgren-Chriss impact thinking.",
+     "Guards: market impact denial, broker-behavior blindness."),
+    ("J portfolio brain", "Positions added up to accidents.",
+     "Lineage: risk-parity + netting discipline.",
+     "Guards: concentration, correlated meltdown."),
+    ("J2 risk pack", "Risk was a single stop-loss number.",
+     "Lineage: CPPI, vol targeting, heat caps, tilt research.",
+     "Guards: drawdown death spirals, revenge trading."),
+    ("K journal+health", "Health checked by gut feel.",
+     "Lineage: v12 telemetry + SRE watchdogs.",
+     "Guards: silent degradation, missed kill signals."),
+    ("L legacy adapters", "v12's 9 strategies deserved a pension, not deletion.",
+     "Lineage: user constraint — improve without stripping.",
+     "Guards: feature deletion, rewrite arrogance."),
+    ("L2 adaptive strategies", "Fixed 9/21, ADX>25, 1.001 bands — numerology that bled.",
+     "Evidence: legacy audit (this file) + Phase-BCD red ink.",
+     "Guards: magic numbers, static votes, martingale recovery."),
+    ("M diagnostics", "No single health command existed.",
+     "Lineage: selftest culture from aerospace checklists.",
+     "Guards: deploying blind, dependency drift."),
+    ("N2 news intel", "News was pure fear, zero data.",
+     "Lineage: event-study literature, per-class calibration.",
+     "Guards: news gambling, arbitrary blackouts."),
+    ("Q CLI", "Operators had no console.",
+     "Lineage: unix philosophy — everything scriptable.",
+     "Guards: GUI-only ops, unrepeatable clicks."),
+    ("R reports", "Results lived in memory and died there.",
+     "Lineage: backtest_*.html tradition, upgraded to tearsheets.",
+     "Guards: rosy recall, unaudited claims."),
+    ("R2 backtest lab", "One equity curve proved nothing.",
+     "Lineage: reshuffle + bootstrap + regime-tear best practice.",
+     "Guards: lucky paths, single-regime edges."),
+    ("T symbol specs", "Pip values hardcoded per symbol.",
+     "Lineage: broker-fact separation (facts vs maths).",
+     "Guards: contract-size errors, pip confusion."),
+    ("W wiring", "Quantum brain had no hands.",
+     "Lineage: adapter pattern; zero v12 edits required.",
+     "Guards: fork drift, untestable integration."),
+    ("VIZ dashboards", "Terminals showed nothing.",
+     "Lineage: trading-desk glanceability.",
+     "Guards: flying blind between reports."),
+    ("CFG profiles", "Risk personality scattered across 50 knobs.",
+     "Lineage: one-knob personalities from fund practice.",
+     "Guards: inconsistent configs, cowboy tuning."),
+    ("EDGE time edges", "Seasonality traded on folklore.",
+     "Lineage: measured time effects only (t-stat or it didn't happen).",
+     "Guards: calendar superstition, unmeasured overlays."),
+    ("X cross-market", "XAU traded as if USD didn't exist.",
+     "Lineage: lead-lag + risk-on/off literature.",
+     "Guards: single-symbol myopia, tide blindness."),
+    ("DEEP systems", "Sizing ignored predictability itself.",
+     "Lineage: Hurst, entropy, GARCH, Kelly, stacking.",
+     "Guards: max-entropy sizing, full-Kelly ruin."),
+    ("OPS integrator", "No routines, no reviews, no brake drill.",
+     "Lineage: checklist manifesto + fund ops desks.",
+     "Guards: cowboy mornings, review-less drift."),
+    ("DOC knowledge base", "Knowledge lived in chat logs.",
+     "Lineage: runbooks ship with the system or they rot.",
+     "Guards: tribal knowledge, onboarding cliffs."),
+    ("QSIG pipeline", "Signals fired from single TFs on single systems.",
+     "Lineage: defense-in-depth — MTF x systems x gates.",
+     "Guards: lone-wolf signals,_HTF_agnostic entries."),
+    ("APEX integration", "Pieces without a production whole.",
+     "Lineage: playbooks + runner + registry close the loop.",
+     "Guards: demo-ware, unshipped research."),
+    ("OMEGA fills", "Paper fills lied about cost.",
+     "Lineage: matching-engine realism (queue, latency, impact).",
+     "Guards: paper-profit fantasy, spread blindness."),
+    ("ZENITH finish", "No arena, no A/B, no alarms, no rollback.",
+     "Lineage: tournament selection + SRE practices.",
+     "Guards: untested promos, silent decay."),
+    ("CROWN stamp", "No final gate before deployment.",
+     "Lineage: launch-readiness reviews.",
+     "Guards: partial deploys, flag rot."),
+    ("EPILOGUE oath", "Operators overrode governors on tilt.",
+     "Lineage: every blown account ever. The oath is the moat.",
+     "Guards: the operator (with love)."),
+)
+
+
+def quantum_annals(section=None):
+    try:
+        if section is None:
+            L = ["QUANTUM ANNALS — why everything exists"]
+            for code, prob, ev, guard in QUANTUM_ANNALS:
+                L.append(f"  {code}: {prob}")
+            return "\n".join(L)
+        key = str(section).upper()
+        for code, prob, ev, guard in QUANTUM_ANNALS:
+            if code.upper().startswith(key):
+                return f"{code}\n  problem: {prob}\n  lineage: {ev}\n  {guard}"
+        return f"no annals entry for {section}"
+    except Exception as e:
+        return str(e)
+
+
+SECTION_ANNALS_OK = True
+
+# ============================================================================
+# COLOPHON — public API surface + build facts (the file's table of contents)
+# ============================================================================
+
+QUANTUM_PUBLIC_API = (
+    # Brain
+    "quantum_calibrated_prob", "quantum_expected_r", "quantum_regime",
+    "quantum_early", "quantum_regime_calibrated", "quantum_regime_observe",
+    "quantum_drift_add", "quantum_drift_factor", "quantum_meta_verdict",
+    "quantum_snapshot", "quantum_blend",
+    # Features + signal
+    "f5_confluence", "quantum_indicators", "quantum_mtf", "quantum_matrix_text",
+    "l2_route", "l2_record", "l2_leaderboard", "quantum_signal", "quantum_fuse",
+    "quantum_killzone", "quantum_killzone_record", "quantum_consult",
+    # Exits + execution + risk
+    "quantum_exits", "quantum_exits_record", "quantum_trail", "quantum_ladder",
+    "quantum_execute", "quantum_quote_guard", "quantum_deadline",
+    "quantum_deadline_sweep", "quantum_fillq_add", "quantum_fillq_report",
+    "quantum_risk_stack", "quantum_size_deep", "quantum_kelly",
+    "quantum_entropy", "quantum_garch", "quantum_fractal", "quantum_heat",
+    "quantum_streak", "quantum_ddshield", "quantum_voltarget",
+    # Research + forensics
+    "quantum_attribute", "quantum_global_importance", "quantum_autopsy2_add",
+    "quantum_autopsy2_report", "quantum_lab", "quantum_parity",
+    "quantum_tournament", "quantum_ab", "quantum_decay", "quantum_corr",
+    "quantum_leadlag", "quantum_risk_gauge", "quantum_rotation",
+    "quantum_edge_overlay", "quantum_pine_features",
+    # Data + news + market
+    "quantum_spec", "quantum_news_calendar_load", "quantum_news_state",
+    "quantum_news_learn_fill", "quantum_news_class_report",
+    "quantum_spreadreg", "quantum_session_heat", "quantum_golden_spec",
+    "quantum_paper_exchange", "quantum_lab_fill",
+    # Ops + reports + docs
+    "quantum_run", "quantum_routine", "quantum_routine_text",
+    "quantum_weekly_review", "quantum_eod", "quantum_heartbeat",
+    "quantum_brake", "quantum_rollback", "quantum_rollback_mark",
+    "quantum_backtest_csv", "quantum_backtest_rows", "quantum_backtest_report",
+    "quantum_live_status_report", "quantum_cli", "quantum_main",
+    "quantum_selftest_text", "quantum_status_text", "quantum_version",
+    "quantum_architecture", "quantum_runbook", "quantum_help",
+    "quantum_doc_topics", "quantum_sections", "quantum_playbook",
+    "quantum_model_card", "quantum_model_cards", "quantum_annals",
+    "quantum_thirty_day_plan", "quantum_risk_disclosure", "quantum_oath",
+    "quantum_epilogue", "quantum_crown", "quantum_crown_banner",
+    "quantum_file_stats", "quantum_integration_check", "quantum_colophon",
+    "quantum_profile", "quantum_cfg", "quantum_profile_ctx", "quantum_min_conf",
+    "qstatus_screen", "ql2_board_text", "qequity_screen", "qspark",
+)
+
+
+def quantum_colophon():
+    try:
+        return (f"Sentinel Quantum {QUANTUM_BUILD['version']} "
+                f"'{QUANTUM_BUILD['codename']}'\n"
+                f"Public API: {len(QUANTUM_PUBLIC_API)} entry points\n"
+                f"Sections: {len(QUANTUM_BUILD['sections'])}  "
+                f"Strategies: {QUANTUM_BUILD['strategies']}\n"
+                f"Lineage: myxauusdbot -> v12.1 fix -> quantum rebuild "
+                f"(nothing deleted, everything earned).")
+    except Exception as e:
+        return str(e)
+
+
+SECTION_COLOPHON_OK = True
+
+# ============================================================================
+# COMPAT — API BRIDGE (new flat names over last-turn singleton getters)
+# ----------------------------------------------------------------------------
+# The E0-H core exposes get_quantum_regime() / get_early_gate() /
+# get_calibrated_scorer() singletons with rich interfaces. Everything from
+# QSIG onward speaks the flat quantum_*() dialect. This bridge translates —
+# with label normalization and signal/context assembly — so both eras work.
+# ============================================================================
+
+_REGIME_LABEL_MAP = {"TREND_UP": "TREND_UP", "TREND_DOWN": "TREND_DOWN",
+                     "RANGE": "RANGE", "SQUEEZE": "QUIET", "PANIC": "VOLATILE",
+                     "MEAN_REVERT": "MEAN_REVERT", "SESSION": "SESSION",
+                     "CHAOS": "CHAOS", "NEWS": "NEWS"}
+
+
+def quantum_regime(df, symbol=None):
+    """Flat regime call -> {regime, conf, agreement, label, raw}.
+
+    Wraps QuantumRegimeEngine.update({tf: df}); normalizes the 5 engine
+    labels onto the 9-regime vocabulary the L2 router speaks.
+    """
+    try:
+        eng = get_quantum_regime(symbol)
+        if eng is None:
+            return {"regime": "RANGE", "conf": 0.34, "agreement": 0.0}
+        try:
+            st = eng.update({"M15": df})
+        except Exception:
+            try:
+                st = eng.update(df)
+            except Exception:
+                st = None
+        if not isinstance(st, dict):
+            try:
+                st = eng.summary()
+            except Exception:
+                st = {}
+        label = str((st or {}).get("label", "RANGE")).upper()
+        return {"regime": _REGIME_LABEL_MAP.get(label, "RANGE"),
+                "label": label,
+                "conf": float(qclip((st or {}).get("confidence", 0.34), 0, 1)),
+                "agreement": float((st or {}).get("agreement", 0.0)),
+                "raw": st}
+    except Exception:
+        return {"regime": "RANGE", "conf": 0.34, "agreement": 0.0}
+
+
+def quantum_early(df, tick=None, symbol=None, regime_state=None):
+    """Flat pre-flight call -> verdict {pass, size_mult, holds, gates}."""
+    try:
+        g = get_early_gate(symbol)
+        if g is None:
+            return {"pass": True, "size_mult": 1.0, "note": "no_gate"}
+        for dfs in ({"M15": df}, df):
+            try:
+                v = g.check(dfs, tick=tick, regime_state=regime_state)
+                if isinstance(v, dict) and "pass" in v:
+                    v.setdefault("size_mult", 1.0)
+                    return v
+            except Exception:
+                continue
+        return {"pass": True, "size_mult": 1.0, "note": "check_fallback"}
+    except Exception:
+        return {"pass": True, "size_mult": 1.0, "note": "fallback"}
+
+
+def _compat_signal_context(feats, side=None):
+    """Assemble E5 (signal, context) from a flat feats dict."""
+    f = dict(feats or {})
+    try:
+        bias = float(f.get("bias", f.get("trinity_vote", 0) or 0))
+    except Exception:
+        bias = 0.0
+    if side is None:
+        side = f.get("side", 0)
+    try:
+        side = int(side)
+    except Exception:
+        side = 0
+    if side == 0:
+        side = 1 if bias >= 0 else -1
+    conf = f.get("conf", f.get("l2conf", f.get("p", 0.5)))
+    try:
+        conf = float(conf)
+    except Exception:
+        conf = 0.5
+    signal = {"score": conf, "dir": "BUY" if side > 0 else "SELL",
+              "strategy": str(f.get("strategy", "?")),
+              "tf": str(f.get("tf", "M15")),
+              "ml_confidence": qclip(conf, 0, 1),
+              "trinity_vote": qclip(bias, -1, 1),
+              "zone_confluence": f.get("zone_confluence", 0),
+              "correlation": f.get("corr", f.get("correlation", 0.0)),
+              "orchestrated": True}
+    regime = f.get("regime", f.get("label", "RANGE"))
+    if isinstance(regime, dict):
+        reg = {"label": regime.get("label", regime.get("regime", "RANGE")),
+               "confidence": regime.get("conf", regime.get("confidence", 0.5)),
+               "agreement": regime.get("agreement", 0.0)}
+    else:
+        reg = {"label": str(regime), "confidence": float(f.get("regime_conf", 0.5)),
+               "agreement": float(f.get("agreement", 0.0))}
+    context = {"regime": reg, "session": str(f.get("session", "OVERLAP")),
+               "spread_pctile": float(f.get("spread_pct", 0.5)),
+               "vol_ratio": float(f.get("vol_ratio", 1.0)),
+               "atr_pct": float(f.get("atr_pct", 0.002)),
+               "range_pos": float(f.get("pos_in_range", f.get("range_pos", 0.5))),
+               "trinity_vote": qclip(bias, -1, 1)}
+    return signal, context
+
+
+def quantum_calibrated_prob(feats, side=None, symbol=None):
+    """Flat E5 probability: feats -> P(win). Returns float 0.01..0.99."""
+    try:
+        scorer = get_calibrated_scorer(symbol)
+        if scorer is None:
+            raise RuntimeError("no_scorer")
+        signal, context = _compat_signal_context(feats, side)
+        out = scorer.predict(signal, context)
+        p = float((out or {}).get("p_win", 0.5))
+        if p != p:
+            p = 0.5
+        return float(qclip(p, 0.01, 0.99))
+    except Exception:
+        try:
+            c = float((feats or {}).get("conf", 0.5))
+            return float(qclip(c, 0.01, 0.99))
+        except Exception:
+            return 0.5
+
+
+def quantum_expected_r(feats, side=None, symbol=None):
+    """Expected payoff in R: p_win * tp_r - (1 - p_win) * 1.
+
+    tp_r comes from the feats' own tp/sl ratio (strategy-declared exits) or
+    the conformal exit table for the strategy. No fixed 2R assumption.
+    """
+    try:
+        p = quantum_calibrated_prob(feats, side, symbol)
+        f = dict(feats or {})
+        tp = float(f.get("tp_atr", f.get("tp_r", 0) or 0))
+        sl = float(f.get("sl_atr", f.get("sl_r", 0) or 0))
+        if not (tp > 0 and sl > 0):
+            try:
+                qe = quantum_exits(str(f.get("strategy", "generic")), 1.0, side or 1)
+                tp = float(qe.get("tp_atr", 2.5))
+                sl = float(qe.get("sl_atr", 2.0))
+            except Exception:
+                tp, sl = 2.5, 2.0
+        tp_r = tp / (sl or 1e-9)
+        return float(p * tp_r - (1 - p) * 1.0)
+    except Exception:
+        return 0.0
+
+
+# ----------------------------------------------------------------------------
+# Section-flag aliases (E0/F1/F2/F4/O2 shipped under combined banners)
+# ----------------------------------------------------------------------------
+try:
+    SECTION_E0_OK = bool(globals().get("SECTION_E1_OK", False))
+    # E0's outcome ledger lives inside the E1 decision log + E4 feedback loop
+    # (outcomes are recorded ON decisions, not in a separate store).
+except Exception:
+    SECTION_E0_OK = False
+
+try:
+    _F12 = bool(globals().get("SECTION_F12_OK", False))
+    SECTION_F1_OK = _F12
+    SECTION_F2_OK = _F12
+except Exception:
+    SECTION_F1_OK = SECTION_F2_OK = False
+
+try:
+    _F4O2 = bool(globals().get("SECTION_F4O2_OK", False))
+    SECTION_F4_OK = _F4O2
+    SECTION_O2_OK = _F4O2
+except Exception:
+    SECTION_F4_OK = SECTION_O2_OK = False
+
+
+def quantum_compat_report():
+    try:
+        L = ["COMPAT BRIDGE STATUS"]
+        for name in ("quantum_regime", "quantum_early", "quantum_calibrated_prob",
+                     "quantum_expected_r"):
+            L.append(f"  {name}: {'OK' if callable(globals().get(name)) else 'MISSING'}")
+        for flag in ("SECTION_E0_OK", "SECTION_F1_OK", "SECTION_F2_OK",
+                     "SECTION_F4_OK", "SECTION_O2_OK"):
+            L.append(f"  {flag}: {globals().get(flag, False)}")
+        for getter in ("get_quantum_regime", "get_early_gate", "get_calibrated_scorer"):
+            try:
+                obj = globals().get(getter, lambda *a, **k: None)()
+                L.append(f"  {getter}: {'alive' if obj is not None else 'None'}")
+            except Exception as e:
+                L.append(f"  {getter}: ERR {e}")
+        return "\n".join(L)
+    except Exception as e:
+        return str(e)
+
+
+SECTION_COMPAT_OK = True
+
+# ============================================================================
+# COMPAT2 — METHOD ALIASES + DICT->PANDAS NORMALIZATION
+# ----------------------------------------------------------------------------
+# Two South-North mismatches, fixed once here instead of at 100+ call sites:
+#  1. QuantileWindow speaks update/quantile/pct_rank; the new code speaks
+#     add/q/percentile. Aliases below (originals untouched).
+#  2. The E6/H engines expect pandas frames (len(df)==rows); the lab and
+#     backtester speak plain dicts (len(dict)==6 keys!). quantum_regime /
+#     quantum_early now normalize dicts to frames before delegating.
+# ============================================================================
+
+try:
+    if "QuantileWindow" in dir() and not hasattr(QuantileWindow, "add"):
+        QuantileWindow.add = QuantileWindow.update
+    if "QuantileWindow" in dir() and not hasattr(QuantileWindow, "q"):
+        QuantileWindow.q = QuantileWindow.quantile
+    if "QuantileWindow" in dir() and not hasattr(QuantileWindow, "percentile"):
+        QuantileWindow.percentile = QuantileWindow.pct_rank
+except Exception:
+    pass
+
+
+def _qcompat_to_frame(df):
+    """Dict-of-lists -> pandas DataFrame; frames pass through untouched."""
+    try:
+        if df is None:
+            return df
+        if isinstance(df, dict):
+            try:
+                import pandas as _pd
+                cols = {k: list(v) for k, v in df.items()
+                        if isinstance(v, (list, tuple))}
+                if cols:
+                    return _pd.DataFrame(cols)
+                return df
+            except Exception:
+                return df
+        return df
+    except Exception:
+        return df
+
+
+try:
+    _QR_ORIG = quantum_regime
+    _QE_ORIG = quantum_early
+
+    def quantum_regime(df, symbol=None):  # noqa: F811 (compat wrapper)
+        try:
+            return _QR_ORIG(_qcompat_to_frame(df), symbol)
+        except Exception:
+            return {"regime": "RANGE", "conf": 0.34, "agreement": 0.0}
+
+    def quantum_early(df, tick=None, symbol=None, regime_state=None):  # noqa: F811
+        try:
+            return _QE_ORIG(_qcompat_to_frame(df), tick, symbol, regime_state)
+        except Exception:
+            return {"pass": True, "size_mult": 1.0, "note": "compat_fallback"}
+except Exception:
+    pass
+
+
+def quantum_compat2_report():
+    try:
+        L = ["COMPAT2 STATUS"]
+        try:
+            w = QuantileWindow(10)
+            w.add(1.0)
+            L.append(f"  aliases: add/q/percentile OK "
+                     f"(q={w.q(0.5)} pct={w.percentile(1.0):.2f} len={len(w)})")
+        except Exception as e:
+            L.append(f"  aliases: ERR {e}")
+        try:
+            f = _qcompat_to_frame({"close": [1, 2, 3]})
+            L.append(f"  to_frame: {type(f).__name__} len={len(f)}")
+        except Exception as e:
+            L.append(f"  to_frame: ERR {e}")
+        return "\n".join(L)
+    except Exception as e:
+        return str(e)
+
+
+SECTION_COMPAT2_OK = True
