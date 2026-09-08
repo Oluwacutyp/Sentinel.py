@@ -30166,3 +30166,1364 @@ class MicrostructureSuite:
 
 
 SECTION_F4O2_OK = True
+
+# ============================================================================
+# F5 — ADAPTIVE SIGNAL SYSTEM PACK (20 classic systems, breathing edition)
+# ----------------------------------------------------------------------------
+# Every system outputs {bias(-1..1), conf(0..1), detail}. Lengths breathe
+# with volatility; trigger levels calibrate to each series' own history.
+# F5Suite pools all 20 into one vote the radar/decider consume.
+# ============================================================================
+
+class _F5Base:
+    @staticmethod
+    def _series(df):
+        return (qas_series(df, "open"), qas_series(df, "high"),
+                qas_series(df, "low"), qas_series(df, "close"))
+
+    @staticmethod
+    def _atr(h, l, c, n=14):
+        a = q_atr_from_lists(h, l, c, n)
+        return a[-1] if a else 0.0
+
+    @staticmethod
+    def _out(bias=0.0, conf=0.0, **kw):
+        d = {"bias": float(qclip(bias, -1, 1)), "conf": float(qclip(conf, 0, 1))}
+        d.update(kw)
+        return d
+
+
+class SupertrendAdaptive(_F5Base):
+    """Supertrend with ATR multiplier from the band's own efficiency history."""
+
+    def analyze(self, df, n=10):
+        try:
+            o, h, l, c = self._series(df)
+            if len(c) < n + 30:
+                return self._out()
+            atr = q_atr_from_lists(h, l, c, n)
+            hl2 = [(h[i] + l[i]) / 2 for i in range(len(c))]
+            # Adaptive multiplier: efficient trends => tighter (2.2), chop => wider (3.6)
+            eff = q_efficiency(c, 50)
+            mult = 3.6 - 1.4 * eff
+            up = [hl2[0] - mult * atr[0]]
+            dn = [hl2[0] + mult * atr[0]]
+            trend = [1]
+            for i in range(1, len(c)):
+                bu = hl2[i] - mult * atr[i]
+                bd = hl2[i] + mult * atr[i]
+                bu = max(bu, up[-1]) if c[i - 1] > up[-1] else bu
+                bd = min(bd, dn[-1]) if c[i - 1] < dn[-1] else bd
+                up.append(bu)
+                dn.append(bd)
+                if trend[-1] == 1 and c[i] < bu:
+                    trend.append(-1)
+                elif trend[-1] == -1 and c[i] > bd:
+                    trend.append(1)
+                else:
+                    trend.append(trend[-1])
+            t = trend[-1]
+            dist = abs(c[-1] - (up[-1] if t > 0 else dn[-1])) / (atr[-1] + 1e-12)
+            return self._out(t * qclip(dist / 2 + 0.4, 0, 1), 0.5 + 0.3 * eff,
+                             mult=round(mult, 2), line=float(up[-1] if t > 0 else dn[-1]))
+        except Exception:
+            return self._out()
+
+
+class ChandelierPack(_F5Base):
+    """Chandelier exits: highest-high/lowest-low minus N×ATR (N adaptive)."""
+
+    def analyze(self, df, n=22):
+        try:
+            o, h, l, c = self._series(df)
+            if len(c) < n + 5:
+                return self._out()
+            a = self._atr(h, l, c)
+            mult = 2.4 + 0.8 * (1 - q_efficiency(c, 50))
+            long_stop = max(h[-n:]) - mult * a
+            short_stop = min(l[-n:]) + mult * a
+            px = c[-1]
+            if px > long_stop and px > short_stop:
+                bias = qclip((px - long_stop) / (a + 1e-12) / 3, 0, 1)
+            elif px < short_stop and px < long_stop:
+                bias = -qclip((short_stop - px) / (a + 1e-12) / 3, 0, 1)
+            else:
+                bias = 0.0
+            return self._out(bias, 0.55, long_stop=float(long_stop),
+                             short_stop=float(short_stop), mult=round(mult, 2))
+        except Exception:
+            return self._out()
+
+
+class PsarBreathing(_F5Base):
+    """Parabolic SAR with acceleration breathing by ADX strength."""
+
+    def analyze(self, df):
+        try:
+            o, h, l, c = self._series(df)
+            if len(c) < 30:
+                return self._out()
+            dmi = q_adx_dmi(h, l, c, 14)
+            af_max = 0.08 + 0.14 * qclip(dmi["adx"], 0, 1)
+            up = c[1] > c[0]
+            sar = l[0] if up else h[0]
+            ep = h[0] if up else l[0]
+            af = 0.02
+            for i in range(1, len(c)):
+                sar = sar + af * (ep - sar)
+                if up:
+                    sar = min(sar, l[i - 1], l[i] if i < len(l) else l[-1])
+                    if c[i] > ep:
+                        ep = c[i]
+                        af = min(af_max, af + 0.02)
+                    if c[i] < sar:
+                        up, sar, ep, af = False, ep, l[i], 0.02
+                else:
+                    sar = max(sar, h[i - 1], h[i] if i < len(h) else h[-1])
+                    if c[i] < ep:
+                        ep = c[i]
+                        af = min(af_max, af + 0.02)
+                    if c[i] > sar:
+                        up, sar, ep, af = True, ep, h[i], 0.02
+            a = self._atr(h, l, c)
+            dist = abs(c[-1] - sar) / (a + 1e-12)
+            return self._out((1 if up else -1) * qclip(dist / 2 + 0.35, 0, 1),
+                             0.45 + 0.3 * qclip(dmi["adx"], 0, 1), sar=float(sar))
+        except Exception:
+            return self._out()
+
+
+class KeltnerIgnition(_F5Base):
+    """Squeeze→ignition trigger: compression percentile + break of micro-rail."""
+
+    def analyze(self, df, n=20):
+        try:
+            o, h, l, c = self._series(df)
+            if len(c) < n + 40:
+                return self._out()
+            m = sum(c[-n:]) / n
+            atr = q_atr_from_lists(h, l, c, 14)
+            a = atr[-1] if atr else 1e-9
+            widths = []
+            for k in range(60, 0, -1):
+                seg = c[-k - n:-k] or c[:n]
+                mm = sum(seg) / max(1, len(seg))
+                aa = atr[-k] if k <= len(atr) else a
+                widths.append(2 * 1.5 * aa / (abs(mm) + 1e-12))
+            now_w = 2 * 1.5 * a / (abs(m) + 1e-12)
+            pct = sum(1 for w in widths if w <= now_w) / max(1, len(widths))
+            rail = sum(c[-5:]) / 5
+            ignite = (c[-1] - rail) / (a + 1e-12)
+            if pct < 0.25 and abs(ignite) > 0.6:
+                return self._out(qsign(ignite) * qclip(abs(ignite) / 2, 0.4, 1),
+                                 0.55 + 0.2 * (1 - pct))
+            return self._out(qclip(ignite / 3, -0.5, 0.5), 0.25, squeeze_pct=round(pct, 2))
+        except Exception:
+            return self._out()
+
+
+class SchaffPack(_F5Base):
+    """Schaff Trend Cycle approximation (stochastic of MACD, double-smoothed)."""
+
+    def analyze(self, df, fast=12, slow=26, cycle=10):
+        try:
+            c = qas_series(df, "close")
+            if len(c) < slow + cycle * 2 + 10:
+                return self._out()
+            def _ema(v, s):
+                o = [v[0]]
+                a = 2 / (s + 1)
+                for x in v[1:]:
+                    o.append(a * x + (1 - a) * o[-1])
+                return o
+            macd = [a - b for a, b in zip(_ema(c, fast), _ema(c, slow))]
+            def _st(v, n):
+                o = []
+                for i in range(len(v)):
+                    w = v[max(0, i - n + 1):i + 1]
+                    o.append((v[i] - min(w)) / (max(w) - min(w) + 1e-12) * 100)
+                return o
+            st1 = _st(macd, cycle)
+            st2 = _st(_ema(st1, cycle // 2 or 1), cycle)
+            v = st2[-1]
+            prev = st2[-2]
+            bias = qclip((v - 50) / 50, -1, 1) * 0.6 + qclip((v - prev) / 20, -1, 1) * 0.4
+            return self._out(bias, 0.5 + abs(v - 50) / 200, value=round(v, 1))
+        except Exception:
+            return self._out()
+
+
+class FisherPack(_F5Base):
+    """Fisher Transform of median price (turning-point sharpener)."""
+
+    def analyze(self, df, n=9):
+        try:
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            if len(h) < n + 10:
+                return self._out()
+            med = [(h[i] + l[i]) / 2 for i in range(len(h))]
+            fish = [0.0]
+            for i in range(1, len(med)):
+                w = med[max(0, i - n + 1):i + 1]
+                hi, lo = max(w), min(w)
+                val = 0.0 if hi == lo else 0.66 * ((med[i] - lo) / (hi - lo) - 0.5) + 0.67 * fish[-1] * 0.5
+                val = max(-0.999, min(0.999, val))
+                import math as _m
+                fish.append(0.5 * _m.log((1 + val) / (1 - val)) + 0.5 * fish[-1])
+            trig = fish[-2] if len(fish) > 1 else 0
+            cross = fish[-1] - trig
+            return self._out(qclip(fish[-1] / 3, -1, 1) * 0.5 + qclip(cross * 2, -1, 1) * 0.5,
+                             0.45 + min(0.3, abs(cross)), value=round(fish[-1], 2))
+        except Exception:
+            return self._out()
+
+
+class LaguerrePack(_F5Base):
+    """Laguerre RSI (time-warped, gamma adaptive to efficiency)."""
+
+    def analyze(self, df, gamma=None):
+        try:
+            c = qas_series(df, "close")
+            if len(c) < 40:
+                return self._out()
+            eff = q_efficiency(c, 50)
+            g = gamma if gamma is not None else (0.55 + 0.3 * eff)
+            L0 = L1 = L2 = L3 = [0.0] * len(c)
+            L0[0], L1[0], L2[0], L3[0] = c[0], c[0], c[0], c[0]
+            for i in range(1, len(c)):
+                L0[i] = (1 - g) * c[i] + g * L0[i - 1]
+                L1[i] = -g * L0[i] + L0[i - 1] + g * L1[i - 1]
+                L2[i] = -g * L1[i] + L1[i - 1] + g * L2[i - 1]
+                L3[i] = -g * L2[i] + L2[i - 1] + g * L3[i - 1]
+            cu = cd = 0.0
+            for a, b in ((L0[-1], L1[-1]), (L1[-1], L2[-1]), (L2[-1], L3[-1])):
+                if a >= b:
+                    cu += a - b
+                else:
+                    cd += b - a
+            rsi = cu / (cu + cd + 1e-12)
+            return self._out(qclip((rsi - 0.5) * 2.2, -1, 1),
+                             0.45 + abs(rsi - 0.5) * 0.6, value=round(rsi, 3))
+        except Exception:
+            return self._out()
+
+
+class TsiPack(_F5Base):
+    """True Strength Index (double-smoothed momentum)."""
+
+    def analyze(self, df, fast=13, slow=25):
+        try:
+            c = qas_series(df, "close")
+            if len(c) < slow + 10:
+                return self._out()
+            m = [c[i] - c[i - 1] for i in range(1, len(c))]
+            am = [abs(x) for x in m]
+            def _ema(v, s):
+                o = [v[0]]
+                a = 2 / (s + 1)
+                for x in v[1:]:
+                    o.append(a * x + (1 - a) * o[-1])
+                return o
+            tsi = _ema(_ema(m, slow), fast)[-1] / (_ema(_ema(am, slow), fast)[-1] + 1e-12) * 100
+            sig = _ema(_ema(m, slow), fast)
+            tsi_prev = sig[-2] / (_ema(_ema(am, slow), fast)[-2] + 1e-12) * 100 if len(sig) > 1 else tsi
+            return self._out(qclip(tsi / 50, -1, 1) * 0.6 + qclip((tsi - tsi_prev) / 10, -1, 1) * 0.4,
+                             0.5, value=round(tsi, 2))
+        except Exception:
+            return self._out()
+
+
+class ElderPack(_F5Base):
+    """Elder Impulse: EMA slope × MACD-histogram agreement."""
+
+    def analyze(self, df, n=13):
+        try:
+            c = qas_series(df, "close")
+            if len(c) < 40:
+                return self._out()
+            def _ema(v, s):
+                o = [v[0]]
+                a = 2 / (s + 1)
+                for x in v[1:]:
+                    o.append(a * x + (1 - a) * o[-1])
+                return o
+            e = _ema(c, n)
+            slope = e[-1] - e[-3]
+            macd = [a - b for a, b in zip(_ema(c, 12), _ema(c, 26))]
+            hist = macd[-1] - _ema(macd, 9)[-1]
+            green = slope > 0 and hist > 0
+            red = slope < 0 and hist < 0
+            a = self._atr(qas_series(df, "high"), qas_series(df, "low"), c)
+            mag = qclip(abs(slope) / (a + 1e-12) * 3, 0, 1)
+            if green:
+                return self._out(0.4 + 0.6 * mag, 0.6 + 0.2 * mag, color="green")
+            if red:
+                return self._out(-0.4 - 0.6 * mag, 0.6 + 0.2 * mag, color="red")
+            return self._out(qsign(slope + hist) * 0.25, 0.3, color="blue")
+        except Exception:
+            return self._out()
+
+
+class CoppockPack(_F5Base):
+    """Coppock Guide (long-horizon accumulation detector)."""
+
+    def analyze(self, df):
+        try:
+            c = qas_series(df, "close")
+            if len(c) < 60:
+                return self._out()
+            r11 = [(c[i] / c[i - 11] - 1) * 100 for i in range(11, len(c))]
+            r14 = [(c[i] / c[i - 14] - 1) * 100 for i in range(14, len(c))]
+            roc = [a + b for a, b in zip(r11[-len(r14):], r14)]
+            def _wma(v, n):
+                wts = list(range(1, n + 1))
+                return sum(x * w for x, w in zip(v[-n:], wts)) / sum(wts)
+            cop = _wma(roc, 10)
+            cop_prev = _wma(roc[:-1], 10)
+            turning = (cop - cop_prev) > 0
+            return self._out(qclip(cop / 15, -1, 1) * 0.5 + (0.4 if turning else -0.4),
+                             0.5, value=round(cop, 2))
+        except Exception:
+            return self._out()
+
+
+class KlingerPack(_F5Base):
+    """Klinger Volume Oscillator (trend × volume force)."""
+
+    def analyze(self, df):
+        try:
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            c = qas_series(df, "close")
+            v = VwapPack._vols(df)
+            n = min(len(h), len(l), len(c), len(v))
+            if n < 60:
+                return self._out()
+            hl2 = [((h[i] + l[i] + c[i]) / 3) for i in range(n)]
+            vf = []
+            for i in range(1, n):
+                d = 1 if hl2[i] >= hl2[i - 1] else -1
+                vf.append(d * v[i])
+            def _ema(vals, s):
+                o = [vals[0]]
+                a = 2 / (s + 1)
+                for x in vals[1:]:
+                    o.append(a * x + (1 - a) * o[-1])
+                return o
+            kvo = _ema(vf, 34)[-1] - _ema(vf, 55)[-1]
+            scale = sum(v[-55:]) / 55 + 1e-12
+            kn = kvo / scale
+            return self._out(qclip(kn * 8, -1, 1), 0.45 + min(0.3, abs(kn) * 4))
+        except Exception:
+            return self._out()
+
+
+class ChaikinPack(_F5Base):
+    """Chaikin Money Flow + A/D slope (accumulation/distribution)."""
+
+    def analyze(self, df, n=20):
+        try:
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            c = qas_series(df, "close")
+            v = VwapPack._vols(df)
+            m = min(len(h), len(l), len(c), len(v))
+            if m < n + 10:
+                return self._out()
+            mfv = []
+            for i in range(m):
+                rng = h[i] - l[i]
+                mfm = ((c[i] - l[i]) - (h[i] - c[i])) / (rng + 1e-12) if rng > 0 else 0
+                mfv.append(mfm * v[i])
+            cmf = sum(mfv[-n:]) / (sum(v[-n:]) + 1e-12)
+            ad = []
+            run = 0.0
+            for x in mfv:
+                run += x
+                ad.append(run)
+            slope = (ad[-1] - ad[-10]) / (sum(v[-10:]) + 1e-12)
+            return self._out(qclip(cmf * 3, -1, 1) * 0.6 + qclip(slope * 30, -1, 1) * 0.4,
+                             0.5, cmf=round(cmf, 3))
+        except Exception:
+            return self._out()
+
+
+class ObvPressure(_F5Base):
+    """OBV z-score + slope (smart-money footprints)."""
+
+    def analyze(self, df, n=50):
+        try:
+            c = qas_series(df, "close")
+            v = VwapPack._vols(df)
+            m = min(len(c), len(v))
+            if m < n + 10:
+                return self._out()
+            obv = [0.0]
+            for i in range(1, m):
+                d = 0
+                if c[i] > c[i - 1]:
+                    d = 1
+                elif c[i] < c[i - 1]:
+                    d = -1
+                obv.append(obv[-1] + d * v[i])
+            z = q_zscore_list(obv, n)
+            slope = (obv[-1] - obv[-11]) / (sum(v[-11:]) + 1e-12)
+            # Bear/bull confirmation: price vs OBV z alignment
+            pz = q_zscore_list(c, n)
+            agree = 1.0 if qsign(z) == qsign(pz) else 0.4
+            return self._out(qclip(z / 2.5, -1, 1) * 0.6 + qclip(slope * 400, -1, 1) * 0.4,
+                             0.4 + 0.3 * agree, z=round(z, 2))
+        except Exception:
+            return self._out()
+
+
+class VwapDeviate(_F5Base):
+    """VWAP deviation regime: stretched rubber snaps back, trends ride."""
+
+    def analyze(self, df):
+        try:
+            v = VwapPack().analyze(df)
+            d = v["dist_sd"]
+            tr = v["trend"]
+            # Regime-aware: range => fade extremes; trend => ride with pullback discount
+            if abs(tr) < 0.35:
+                return self._out(qclip(-d / 2, -1, 1), 0.5 + min(0.3, abs(d) / 8), mode="fade")
+            pullback = abs(d) < 0.8
+            return self._out(qsign(tr) * (1.0 if pullback else 0.45), 0.5, mode="ride")
+        except Exception:
+            return self._out()
+
+
+class PocMigration(_F5Base):
+    """Rolling Point-of-Control drift (value migration direction)."""
+
+    def analyze(self, df, bins=24, win=120):
+        try:
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            c = qas_series(df, "close")
+            v = VwapPack._vols(df)
+            n = min(len(h), len(l), len(c), len(v))
+            if n < win + 10:
+                return self._out()
+            def _poc(lo, hi):
+                seg_h, seg_l = h[lo:hi], l[lo:hi]
+                top, bot = max(seg_h), min(seg_l)
+                if top - bot <= 1e-12:
+                    return c[hi - 1]
+                prof = [0.0] * bins
+                for i in range(lo, hi):
+                    b = min(bins - 1, int((c[i] - bot) / (top - bot) * bins))
+                    prof[b] += v[i]
+                return bot + (prof.index(max(prof)) + 0.5) / bins * (top - bot)
+            p_old = _poc(n - win, n - win // 2)
+            p_new = _poc(n - win // 2, n)
+            rng = max(h[-win:]) - min(l[-win:]) + 1e-12
+            drift = (p_new - p_old) / rng
+            return self._out(qclip(drift * 6, -1, 1), 0.45 + min(0.3, abs(drift) * 3),
+                             poc=round(p_new, 2))
+        except Exception:
+            return self._out()
+
+
+class DonchianStorm(_F5Base):
+    """Donchian breakout + failure-fade (turtle with a trap detector)."""
+
+    def analyze(self, df, n=20):
+        try:
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            c = qas_series(df, "close")
+            if len(c) < n + 15:
+                return self._out()
+            hi = max(h[-n - 1:-1])
+            lo = min(l[-n - 1:-1])
+            px = c[-1]
+            rng = hi - lo + 1e-12
+            if px > hi:
+                # Storm: follow-through? or trap (close back inside + long wick)?
+                back_inside = c[-1] < hi and h[-1] > hi
+                if back_inside:
+                    return self._out(-0.75, 0.65, trap="bull_trap")
+                follow = (px - hi) / rng
+                return self._out(qclip(0.5 + follow * 2, 0, 1), 0.55 + min(0.2, follow))
+            if px < lo:
+                back_inside = c[-1] > lo and l[-1] < lo
+                if back_inside:
+                    return self._out(0.75, 0.65, trap="bear_trap")
+                follow = (lo - px) / rng
+                return self._out(-qclip(0.5 + follow * 2, 0, 1), 0.55 + min(0.2, follow))
+            pos = (px - lo) / rng
+            return self._out(qclip((pos - 0.5) * 1.2, -0.6, 0.6), 0.3)
+        except Exception:
+            return self._out()
+
+
+class CmoPack(_F5Base):
+    """Chande Momentum Oscillator (up/down-sum symmetric momentum)."""
+
+    def analyze(self, df, n=14):
+        try:
+            c = qas_series(df, "close")
+            if len(c) < n + 5:
+                return self._out()
+            up = sum(max(0, c[i] - c[i - 1]) for i in range(-n, 0))
+            dn = sum(max(0, c[i - 1] - c[i]) for i in range(-n, 0))
+            cmo = 100 * (up - dn) / (up + dn + 1e-12)
+            return self._out(qclip(cmo / 60, -1, 1), 0.45 + min(0.3, abs(cmo) / 200),
+                             value=round(cmo, 1))
+        except Exception:
+            return self._out()
+
+
+class TrixPack(_F5Base):
+    """TRIX: triple-EMA ROC (trend persistence filter)."""
+
+    def analyze(self, df, n=15):
+        try:
+            c = qas_series(df, "close")
+            if len(c) < n * 2 + 10:
+                return self._out()
+            def _ema(v, s):
+                o = [v[0]]
+                a = 2 / (s + 1)
+                for x in v[1:]:
+                    o.append(a * x + (1 - a) * o[-1])
+                return o
+            t = _ema(_ema(_ema(c, n), n), n)
+            trix = (t[-1] / t[-2] - 1) * 10000 if t[-2] else 0
+            trix_p = (t[-2] / t[-3] - 1) * 10000 if len(t) > 2 and t[-3] else trix
+            return self._out(qclip(trix / 8, -1, 1) * 0.6 + qclip((trix - trix_p) * 2, -1, 1) * 0.4,
+                             0.5, value=round(trix, 2))
+        except Exception:
+            return self._out()
+
+
+class McGinleyPack(_F5Base):
+    """McGinley Dynamic (self-adjusting, whipsaw-resistant average)."""
+
+    def analyze(self, df, n=14):
+        try:
+            c = qas_series(df, "close")
+            if len(c) < n + 10:
+                return self._out()
+            md = [c[0]]
+            for x in c[1:]:
+                k = 0.6 * n * (x / md[-1]) ** 4 if md[-1] else n
+                md.append(md[-1] + (x - md[-1]) / (k / 2 + 1e-12))
+            a = self._atr(qas_series(df, "high"), qas_series(df, "low"), c)
+            dist = (c[-1] - md[-1]) / (a + 1e-12)
+            slope = (md[-1] - md[-5]) / (a + 1e-12)
+            return self._out(qclip(dist / 2, -1, 1) * 0.5 + qclip(slope, -1, 1) * 0.5,
+                             0.5, value=round(md[-1], 2))
+        except Exception:
+            return self._out()
+
+
+class RoofingPack(_F5Base):
+    """Roofing filter (highpass + super-smoother): cycle-true momentum."""
+
+    def analyze(self, df, hp=48):
+        try:
+            c = qas_series(df, "close")
+            if len(c) < hp + 30:
+                return self._out()
+            import math as _m
+            a1 = _m.exp(-1.414 * _m.pi / (hp / 2))
+            b1 = 2 * a1 * _m.cos(1.414 * _m.pi / (hp / 2))
+            c2, c3, c1 = b1, -a1 * a1, 1 - b1 - c3
+            filt = [0.0, 0.0]
+            for i in range(2, len(c)):
+                filt.append(c1 * (c[i] + c[i - 1]) / 2 + c2 * filt[-1] + c3 * filt[-2])
+            v, p = filt[-1], filt[-6]
+            rng = max(filt[-hp:]) - min(filt[-hp:]) + 1e-12
+            return self._out(qclip(v / rng * 2, -1, 1) * 0.5 + qclip((v - p) / rng * 4, -1, 1) * 0.5,
+                             0.5)
+        except Exception:
+            return self._out()
+
+
+class F5Suite:
+    """Pool all 20 adaptive systems -> one bias/conf + ranked votes."""
+
+    SYSTEMS = (("supertrend", SupertrendAdaptive), ("chandelier", ChandelierPack),
+               ("psar", PsarBreathing), ("ignition", KeltnerIgnition),
+               ("schaff", SchaffPack), ("fisher", FisherPack),
+               ("laguerre", LaguerrePack), ("tsi", TsiPack),
+               ("elder", ElderPack), ("coppock", CoppockPack),
+               ("klinger", KlingerPack), ("chaikin", ChaikinPack),
+               ("obv", ObvPressure), ("vwapdev", VwapDeviate),
+               ("poc", PocMigration), ("donchian", DonchianStorm),
+               ("cmo", CmoPack), ("trix", TrixPack),
+               ("mcginley", McGinleyPack), ("roofing", RoofingPack))
+
+    def __init__(self):
+        self.instances = {name: cls() for name, cls in self.SYSTEMS}
+
+    def scan(self, df):
+        out = {"bias": 0.0, "conf": 0.0, "votes": [], "n": 0}
+        try:
+            votes = []
+            for name, inst in self.instances.items():
+                try:
+                    r = inst.analyze(df)
+                    if r["conf"] > 0.05:
+                        votes.append((name, r["bias"], r["conf"]))
+                except Exception:
+                    continue
+            out["n"] = len(votes)
+            if not votes:
+                return out
+            tot = sum(w for _, _, w in votes) or 1.0
+            bias = sum(b * w for _, b, w in votes) / tot
+            bs = [b for _, b, _ in votes]
+            agree = 1 - (max(bs) - min(bs)) / 4
+            out.update({"bias": float(qclip(bias, -1, 1)),
+                        "conf": float(qclip(agree * min(1.0, tot / 8.0), 0, 1))})
+            votes.sort(key=lambda t: -abs(t[1]) * t[2])
+            out["votes"] = [{"src": s, "bias": round(float(b), 3), "conf": round(float(w), 3)}
+                            for s, b, w in votes[:8]]
+            return out
+        except Exception:
+            return out
+
+
+_F5_SINGLETON = {"obj": None}
+
+
+def f5_confluence(df):
+    try:
+        o = _F5_SINGLETON.get("obj")
+        if o is None:
+            o = F5Suite()
+            _F5_SINGLETON["obj"] = o
+        return o.scan(df)
+    except Exception:
+        return {"bias": 0.0, "conf": 0.0, "votes": [], "n": 0}
+
+
+SECTION_F5_OK = True
+
+# ============================================================================
+# L2 — ADAPTIVE STRATEGY PACK (the shake-up: 9 legacy strategies reborn)
+# ----------------------------------------------------------------------------
+# AUDIT — what was shaken up and why (legacy line refs @ ~30.8k snapshot):
+#
+#  1. TrendFollowingStrategy (l.12098): ema9/ema21 cross + adx>25 + fixed
+#     1.2xATR pullback band. PROBLEM: 9/21/25 are numerology; ADX 25 means
+#     different things on XAU M5 vs BTC H1. REBORN AS: AdaptiveTrendRider —
+#     EMA lengths breathe with efficiency, ADX gate is a rolling quantile,
+#     pullback band widths come from ATR distribution, confidence is
+#     calibrated not hand-scored.
+#  2. BreakoutStrategy (l.12301): high_20/low_20 + adx>25 + FIXED 3xATR SL /
+#     6xATR TP (forced 1:2). PROBLEM: fixed 1:2 ignores structure; 20-bar
+#     lookback blind to volatility. REBORN AS: AdaptiveBreakoutHunter —
+#     lookback breathes, SL/TP from structure + learned R calibration,
+#     trap-fade kept but threshold adaptive.
+#  3. MeanReversionStrategyV18 (l.11476) + V18 (l.18718): fixed z/band logic.
+#     REBORN AS: AdaptiveSwingCatcher — z-window breathes, entry bands from
+#     rolling quantiles, HTF regime alignment gate added.
+#  4. PullbackRetracementStrategy (l.12436): fixed fib levels 38.2/50/61.8.
+#     REBORN AS: part of SwingCatcher — reaction-validated fibs (levels that
+#     never react are down-weighted by the miner).
+#  5. SMCLiquidityStrategy (l.12602): BOS/liquidity-sweep detection kept in
+#     F3 (ICTPack) but thresholds now adaptive; sweep entries validated by
+#     displacement quantile, not fixed pips.
+#  6. ScalpingStrategy (l.18881) + ScalpingEngine (l.5101): 1.001/0.999 micro
+#     bands (10 bps — wider than XAU spread, dead on arrival) + raw velocity.
+#     REBORN AS: AdaptiveScalpSniper — spread-normalized targets, killzone
+#     gate, tick-imbalance trigger, adverse-excursion kill.
+#  7. NewsImpactStrategy (l.12740) + NewsProtector (l.5402) + Straddle (l.8106):
+#     fixed blackout minutes + fixed straddle distance. REBORN AS:
+#     AdaptiveNewsSentinel — blackout from realized news-vol history per
+#     event class, straddle from expected-move quantile, post-news ignition.
+#  8. AbsoluteRecoveryEngine (l.16613) + OfflineRecovery (l.16567): staged
+#     recovery sizing (martingale-adjacent). REBORN AS: AdaptiveRecoveryPilot
+#     — recovery size gated on live edge estimate; no edge => no scaling.
+#  9. HedgeGradeBattleBot (l.22190): hedge triggers on fixed drawdown pips.
+#     REBORN AS: AdaptiveHedgeGuardian — correlation/beta-triggered hedge
+#     with quantum sizing, targeting net-zero delta not fixed lots.
+# 10. StrategyOrchestrator (l.12740) + StrategyEngine (l.14748) + Ensemble
+#     (l.11365): fixed strategy weights / static voting. REBORN AS:
+#     L2Suite — performance-weighted votes (expectancy × sqrt(n)), weights
+#     evolve per regime; dead strategies auto-parked.
+#
+# Every L2 strategy: analyze(ctx) -> {side, conf, sl_atr, tp_atr, reason},
+# plus record(result_r) for self-stats and weight evolution.
+# ctx keys: df, htf_df, regime(str), session, spread, spread_pct, atr,
+#           equity, balance, open_risk_r, news_state, tick_imb, symbol.
+# ============================================================================
+
+class L2Stats:
+    """Per-strategy rolling performance ledger -> auto weight."""
+
+    def __init__(self, name, window=60):
+        self.name = name
+        self.window = window
+        self.rs = []
+        self.wins = 0
+        self.n = 0
+
+    def record(self, r):
+        try:
+            r = float(r)
+        except Exception:
+            return
+        self.rs.append(r)
+        self.rs = self.rs[-self.window:]
+        self.n += 1
+        if r > 0:
+            self.wins += 1
+
+    @property
+    def expectancy(self):
+        return sum(self.rs) / len(self.rs) if self.rs else 0.0
+
+    @property
+    def win_rate(self):
+        return self.wins / self.n if self.n else 0.5
+
+    def weight(self):
+        # Expectancy x evidence; floored so new strats get a trial budget
+        if self.n < 8:
+            return 0.5
+        ev = self.expectancy
+        if ev <= 0:
+            return 0.05
+        return qclip(ev * (self.n ** 0.5) / 3.0, 0.05, 1.5)
+
+    def parked(self):
+        return self.n >= 20 and self.expectancy < -0.05
+
+
+class _L2Base:
+    name = "base"
+
+    def __init__(self):
+        self.stats = L2Stats(self.name)
+        self._adx_win = QuantileWindow(400)
+        self._atr_win = QuantileWindow(400)
+
+    def _cols(self, ctx):
+        df = ctx.get("df")
+        return (qas_series(df, "open"), qas_series(df, "high"),
+                qas_series(df, "low"), qas_series(df, "close"))
+
+    def _adx_pct(self, dmi_val):
+        self._adx_win.add(dmi_val)
+        return self._adx_win.percentile(dmi_val)
+
+    def _atr_pct(self, atr_val):
+        self._atr_win.add(atr_val)
+        return self._atr_win.percentile(atr_val)
+
+    def _sig(self, side=0, conf=0.0, sl_atr=2.0, tp_atr=3.0, reason="", **kw):
+        d = {"strategy": self.name, "side": int(qsign(side)), "conf": float(qclip(conf, 0, 1)),
+             "sl_atr": float(sl_atr), "tp_atr": float(tp_atr), "reason": reason}
+        d.update(kw)
+        return d
+
+    def record(self, r):
+        self.stats.record(r)
+
+    def suitable(self, regime):
+        return True
+
+
+class AdaptiveTrendRider(_L2Base):
+    """Trend ride with breathing EMAs + quantile ADX gate + calibrated conf."""
+
+    name = "trend_rider"
+
+    def suitable(self, regime):
+        return regime in ("TREND_UP", "TREND_DOWN", "VOLATILE")
+
+    def analyze(self, ctx):
+        try:
+            o, h, l, c = self._cols(ctx)
+            if len(c) < 80:
+                return self._sig(reason="warmup")
+            eff = q_efficiency(c, 50)
+            # Breathing lengths: efficient => fast (6/18), chop => slow (14/40)
+            fast_n = int(round(14 - 8 * eff))
+            slow_n = int(round(40 - 22 * eff))
+            def _ema(v, s):
+                out = [v[0]]
+                a = 2 / (s + 1)
+                for x in v[1:]:
+                    out.append(a * x + (1 - a) * out[-1])
+                return out
+            ef, es = _ema(c, fast_n), _ema(c, slow_n)
+            dmi = q_adx_dmi(h, l, c, 14)
+            adx_pct = self._adx_pct(dmi["adx"])
+            atrs = q_atr_from_lists(h, l, c, 14)
+            atr = atrs[-1] if atrs else 1e-9
+            atr_pct = self._atr_pct(atr)
+            # Pullback band: width from ATR quantile (tight in calm, wide in storm)
+            band = (0.7 + 1.4 * atr_pct) * atr
+            dist = abs(c[-1] - ef[-1])
+            up = ef[-1] > es[-1]
+            # Gate: trend alignment + ADX in top 40% of own history + near fast EMA
+            if adx_pct < 0.6 or dist > band:
+                return self._sig(reason="no_alignment")
+            # Calibrated confidence via E5 if available
+            feats = {"adx_pct": adx_pct, "eff": eff, "ema_gap_atr": (ef[-1] - es[-1]) / (atr + 1e-12),
+                     "dist_band": dist / (band + 1e-12)}
+            try:
+                cal = quantum_calibrated_prob(feats)
+            except Exception:
+                cal = 0.5 + 0.3 * (adx_pct - 0.5)
+            side = 1 if up else -1
+            # HTF alignment bonus
+            try:
+                hc = qas_series(ctx.get("htf_df"), "close")
+                if len(hc) > 30:
+                    h_up = hc[-1] > sum(hc[-30:]) / 30
+                    if (side > 0) == h_up:
+                        cal = min(0.97, cal + 0.08)
+                    else:
+                        cal = max(0.05, cal - 0.12)
+            except Exception:
+                pass
+            # Structure SL (beyond slow EMA + buffer), TP from E5 R-calibration
+            sl_atr = abs(c[-1] - es[-1]) / (atr + 1e-12) + 0.8
+            sl_atr = qclip(sl_atr, 1.2, 4.0)
+            try:
+                tp_atr = qclip(quantum_expected_r(feats, side), 1.0, 6.0)
+            except Exception:
+                tp_atr = sl_atr * 1.8
+            return self._sig(side, cal, sl_atr, tp_atr,
+                             f"ema{fast_n}/{slow_n} adx%{adx_pct:.2f} eff{eff:.2f}")
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveBreakoutHunter(_L2Base):
+    """Volatility-breathed Donchian + structure SL + learned R targets."""
+
+    name = "breakout_hunter"
+
+    def suitable(self, regime):
+        return regime in ("RANGE", "VOLATILE", "TREND_UP", "TREND_DOWN")
+
+    def analyze(self, ctx):
+        try:
+            o, h, l, c = self._cols(ctx)
+            if len(c) < 80:
+                return self._sig(reason="warmup")
+            atrs = q_atr_from_lists(h, l, c, 14)
+            atr = atrs[-1] if atrs else 1e-9
+            vol_pct = self._atr_pct(atr)
+            # Lookback breathes: calm => 30 (patient), storm => 12 (reactive)
+            n = int(round(30 - 18 * vol_pct))
+            hi = max(h[-n - 1:-1])
+            lo = min(l[-n - 1:-1])
+            px = c[-1]
+            dmi = q_adx_dmi(h, l, c, 14)
+            adx_pct = self._adx_pct(dmi["adx"])
+            # Squeeze pre-condition: range must be compressed vs own history
+            rng = (hi - lo) / (atr + 1e-12)
+            side = 0
+            if px > hi and adx_pct > 0.45:
+                side = 1
+            elif px < lo and adx_pct > 0.45:
+                side = -1
+            else:
+                return self._sig(reason="inside_range")
+            # Trap check (adaptive wick ratio from recent bars)
+            wicks = []
+            for i in range(-11, -1):
+                rng_i = h[i] - l[i] + 1e-12
+                w = (h[i] - max(c[i], o[i])) / rng_i if side > 0 else (min(c[i], o[i]) - l[i]) / rng_i
+                wicks.append(w)
+            trap_wick = (h[-1] - max(c[-1], o[-1])) / (h[-1] - l[-1] + 1e-12) if side > 0 else (min(c[-1], o[-1]) - l[-1]) / (l[-1] - l[-1] + 1e-12 if False else (h[-1] - l[-1] + 1e-12))
+            med_wick = sorted(wicks)[len(wicks) // 2]
+            if trap_wick > med_wick + 0.35 and abs(c[-1] - (hi if side > 0 else lo)) < 0.2 * atr:
+                return self._sig(reason="trap_fade_skip")
+            # Volume confirm: adaptive ratio (session-aware via ctx)
+            try:
+                v = VwapPack._vols(ctx.get("df"))
+                vr = sum(v[-3:]) / (sum(v[-23:-3]) / 20 + 1e-12) if len(v) > 25 else 1.0
+            except Exception:
+                vr = 1.0
+            sess = str(ctx.get("session", "")).upper()
+            need_vr = 0.8 if sess in ("LONDON", "OVERLAP", "NEWYORK") else 1.15
+            if vr < need_vr:
+                return self._sig(reason="no_volume")
+            # Structure SL: beyond broken level + buffer; TP from learned R
+            lvl = hi if side > 0 else lo
+            sl_atr = qclip(abs(px - lvl) / (atr + 1e-12) + 1.0, 1.0, 3.5)
+            feats = {"adx_pct": adx_pct, "vol_ratio": vr, "range_atr": rng,
+                     "break_dist_atr": abs(px - lvl) / (atr + 1e-12)}
+            try:
+                conf = quantum_calibrated_prob(feats)
+                tp_atr = qclip(quantum_expected_r(feats, side), 1.0, 6.0)
+            except Exception:
+                conf, tp_atr = 0.55, sl_atr * 1.8
+            return self._sig(side, conf, sl_atr, tp_atr, f"donch{n} vr{vr:.2f}")
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveSwingCatcher(_L2Base):
+    """Mean-reversion with breathing z-window + quantile bands + HTF gate."""
+
+    name = "swing_catcher"
+
+    def suitable(self, regime):
+        return regime in ("RANGE", "QUIET", "MEAN_REVERT")
+
+    def analyze(self, ctx):
+        try:
+            o, h, l, c = self._cols(ctx)
+            if len(c) < 100:
+                return self._sig(reason="warmup")
+            eff = q_efficiency(c, 50)
+            # Window breathes: efficient => short (30), chop => long (80)
+            n = int(round(80 - 50 * eff))
+            seg = c[-n:]
+            mu = sum(seg) / n
+            var = sum((x - mu) ** 2 for x in seg) / n
+            sd = var ** 0.5 + 1e-12
+            z = (c[-1] - mu) / sd
+            # Entry band from rolling z quantiles (own history, not 2.0 magic)
+            if not hasattr(self, "_zwin"):
+                self._zwin = QuantileWindow(300)
+            self._zwin.add(abs(z))
+            band = self._zwin.q(0.85) or 1.8
+            if abs(z) < band:
+                return self._sig(reason="no_stretch")
+            side = -1 if z > 0 else 1
+            # HTF gate: don't fade a strong HTF trend
+            try:
+                hc = qas_series(ctx.get("htf_df"), "close")
+                if len(hc) > 30:
+                    h_mo = (hc[-1] - hc[-30]) / (hc[-30] + 1e-12)
+                    atrs = q_atr_from_lists(h, l, c, 14)
+                    a = atrs[-1] if atrs else 1e-9
+                    if abs(h_mo) > 2.5 * a / (c[-1] + 1e-12) and qsign(h_mo) != side:
+                        return self._sig(reason="htf_against")
+            except Exception:
+                pass
+            # SL beyond the extreme + buffer; TP = mean (adaptive R)
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else 1e-9
+            extreme = max(h[-5:]) if side < 0 else min(l[-5:])
+            sl_atr = qclip(abs(c[-1] - extreme) / a + 0.7, 1.0, 4.0)
+            tp_atr = qclip(abs(c[-1] - mu) / a, 0.8, 5.0)
+            feats = {"z": z / 3.0, "band": band / 3.0, "eff": eff}
+            try:
+                conf = quantum_calibrated_prob(feats)
+            except Exception:
+                conf = 0.5 + min(0.3, (abs(z) - band) / 4)
+            return self._sig(side, conf, sl_atr, tp_atr, f"z{z:.2f} band{band:.2f}")
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveScalpSniper(_L2Base):
+    """Spread-normalized micro-scalps: killzone + imbalance trigger + AE kill."""
+
+    name = "scalp_sniper"
+
+    def suitable(self, regime):
+        return regime in ("QUIET", "RANGE", "SESSION")
+
+    def analyze(self, ctx):
+        try:
+            o, h, l, c = self._cols(ctx)
+            if len(c) < 40:
+                return self._sig(reason="warmup")
+            sess = str(ctx.get("session", "")).upper()
+            # Killzone: only trade liquid sessions (adaptive per symbol stats if present)
+            try:
+                prof = session_profile(sess or "UNKNOWN")
+                liq = prof.get("liquidity", 0.5) if isinstance(prof, dict) else 0.5
+            except Exception:
+                liq = 0.6 if sess in ("LONDON", "OVERLAP", "NEWYORK") else 0.3
+            if liq < 0.45:
+                return self._sig(reason="dead_zone")
+            spread = float(ctx.get("spread", 0) or 0)
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else 1e-9
+            # Spread must be < 12% of micro-target; target itself from micro-vol
+            micro = sum(abs(c[i] - c[i - 1]) for i in range(-10, 0)) / 10
+            tgt = max(micro * 1.5, 1e-12)
+            if spread > 0 and spread / tgt > 0.12:
+                return self._sig(reason="spread_too_wide")
+            imb = float(ctx.get("tick_imb", 0) or 0)
+            if abs(imb) < 0.25:
+                return self._sig(reason="no_imbalance")
+            side = qsign(imb)
+            # Micro-structure confirm: last 3 closes lean the same way
+            lean = sum(qsign(c[i] - c[i - 1]) for i in range(-3, 0))
+            if qsign(lean) != side and lean != 0:
+                return self._sig(reason="no_lean")
+            sl_atr = qclip(tgt * 0.8 / (a + 1e-12), 0.15, 1.0)
+            tp_atr = qclip(tgt * 1.4 / (a + 1e-12), 0.2, 1.5)
+            conf = 0.5 + min(0.35, abs(imb) * 0.4 + liq * 0.1)
+            return self._sig(side, conf, sl_atr, tp_atr, f"imb{imb:.2f} liq{liq:.2f}",
+                             max_hold_bars=12)
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveNewsSentinel(_L2Base):
+    """Event-class-calibrated blackout + expected-move straddle + ignition."""
+
+    name = "news_sentinel"
+    # Per-class realized-vol memory: event_class -> QuantileWindow of post-move ATRs
+    _class_moves = {}
+
+    def suitable(self, regime):
+        return True
+
+    def _move_win(self, klass):
+        w = self._class_moves.get(klass)
+        if w is None:
+            w = QuantileWindow(60)
+            self._class_moves[klass] = w
+        return w
+
+    def analyze(self, ctx):
+        try:
+            ns = ctx.get("news_state") or {}
+            mins_to = ns.get("mins_to_event", None)
+            klass = str(ns.get("event_class", "medium")).lower()
+            o, h, l, c = self._cols(ctx)
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else 1e-9
+            if mins_to is None:
+                return self._sig(reason="no_event")
+            w = self._move_win(klass)
+            exp_move = w.q(0.6) or 2.0  # expected move in ATRs for this class
+            # Adaptive blackout: wider for violent classes
+            blackout = int(round(5 + exp_move * 8))
+            if 0 <= mins_to <= blackout:
+                return self._sig(reason=f"blackout_{blackout}m", veto=True)
+            if -blackout <= mins_to < 0:
+                # Post-news ignition: trade the displacement if it exceeds expectation
+                disp = abs(c[-1] - c[-3]) / (a + 1e-12) if len(c) > 3 else 0
+                if disp < exp_move * 0.5:
+                    return self._sig(reason="no_ignition")
+                side = qsign(c[-1] - c[-3])
+                return self._sig(side, 0.55, 1.5, qclip(exp_move, 1.5, 6.0),
+                                 f"ignition disp{disp:.1f}a exp{exp_move:.1f}a")
+            if 0 < mins_to <= blackout + 10:
+                # Pre-news straddle: distance from expected-move quantile
+                dist = (w.q(0.75) or 2.5) * a
+                return self._sig(0, 0.4, 1.0, 2.0, f"straddle {dist:.1f}",
+                                 straddle_dist=float(dist), pending="both")
+            return self._sig(reason="outside_window")
+        except Exception:
+            return self._sig(reason="error")
+
+    def record_news_move(self, klass, move_atr):
+        try:
+            self._move_win(str(klass).lower()).add(float(move_atr))
+        except Exception:
+            pass
+
+
+class AdaptiveGridWeaver(_L2Base):
+    """ATR-quantile grid with bias filter + drawdown-aware pause."""
+
+    name = "grid_weaver"
+
+    def suitable(self, regime):
+        return regime in ("RANGE", "QUIET")
+
+    def analyze(self, ctx):
+        try:
+            o, h, l, c = self._cols(ctx)
+            if len(c) < 60:
+                return self._sig(reason="warmup")
+            # Pause grid when portfolio heat is high or regime shaky
+            if float(ctx.get("open_risk_r", 0) or 0) > 2.0:
+                return self._sig(reason="heat_pause")
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else 1e-9
+            # Grid step from ATR quantile: wide grids in storm, tight in calm
+            vol_pct = self._atr_pct(a)
+            step_atr = 0.6 + 1.2 * vol_pct
+            # Direction filter: only weave WITH the quantum bias
+            try:
+                bias = float(ctx.get("quantum_bias", 0) or 0)
+            except Exception:
+                bias = 0.0
+            if abs(bias) < 0.15:
+                side = 0  # neutral: weave both sides, half size
+            else:
+                side = qsign(bias)
+            n = c[-1]
+            levels_up = [n + step_atr * a * i for i in (1, 2, 3)]
+            levels_dn = [n - step_atr * a * i for i in (1, 2, 3)]
+            return self._sig(side, 0.45, step_atr * 3.2, step_atr,
+                             f"step{step_atr:.2f}a bias{bias:.2f}",
+                             grid_up=[round(x, 2) for x in levels_up],
+                             grid_dn=[round(x, 2) for x in levels_dn],
+                             size_mult=0.5 if side == 0 else 0.8)
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveHedgeGuardian(_L2Base):
+    """Beta-triggered hedge: targets net-zero delta, quantum-sized."""
+
+    name = "hedge_guardian"
+
+    def suitable(self, regime):
+        return True
+
+    def analyze(self, ctx):
+        try:
+            book = ctx.get("book") or {}
+            exposure = float(book.get("net_delta", 0) or 0)
+            if abs(exposure) < 0.5:
+                return self._sig(reason="flat_enough")
+            # Hedge only when unrealized pain is real (adaptive: vs own equity vol)
+            u_pnl_r = float(book.get("unreal_r", 0) or 0)
+            if u_pnl_r > -0.8:
+                return self._sig(reason="no_pain")
+            # Correlation check: hedge instrument must actually offset
+            corr = float(ctx.get("hedge_corr", 0.85) or 0.85)
+            if abs(corr) < 0.5:
+                return self._sig(reason="corr_too_low")
+            side = -qsign(exposure)
+            # Size: neutralize fraction from pain depth (never full flip)
+            frac = qclip(abs(u_pnl_r) / 4.0, 0.25, 0.8)
+            return self._sig(side, 0.6, 2.0, 2.0, f"neutralize{frac:.0%} corr{corr:.2f}",
+                             hedge_frac=float(frac), reduce_only=False)
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveRecoveryPilot(_L2Base):
+    """Edge-gated recovery: scales ONLY when live edge estimate is positive."""
+
+    name = "recovery_pilot"
+
+    def suitable(self, regime):
+        return regime not in ("CHAOS", "NEWS")
+
+    def analyze(self, ctx):
+        try:
+            dd_r = abs(float(ctx.get("drawdown_r", 0) or 0))
+            if dd_r < 2.0:
+                return self._sig(reason="no_drawdown")
+            # Live edge estimate from recent journal (last 20 closed R)
+            try:
+                recent = list(ctx.get("recent_r", []) or [])[-20:]
+                edge = sum(recent) / len(recent) if len(recent) >= 10 else 0.0
+            except Exception:
+                edge = 0.0
+            if edge <= 0.02:
+                return self._sig(reason="no_edge_no_scale")
+            # Scale factor from edge strength, capped hard
+            mult = qclip(1 + edge * 2.0, 1.0, 1.8)
+            # Direction: WITH the higher-timeframe drift only
+            try:
+                hc = qas_series(ctx.get("htf_df"), "close")
+                side = 1 if hc[-1] > sum(hc[-20:]) / 20 else -1
+            except Exception:
+                side = 0
+            if side == 0:
+                return self._sig(reason="no_htf")
+            stage = min(3, int(dd_r // 3) + 1)
+            return self._sig(side, 0.5 + min(0.25, edge), 1.8, 2.5,
+                             f"stage{stage} edge{edge:.2f}R", size_mult=float(mult),
+                             stage=stage)
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveDivergenceSniper(_L2Base):
+    """F3-divergence + quantile RSI + structure confirmation (replaces fixed Div)."""
+
+    name = "divergence_sniper"
+
+    def suitable(self, regime):
+        return regime in ("RANGE", "TREND_UP", "TREND_DOWN", "VOLATILE")
+
+    def analyze(self, ctx):
+        try:
+            df = ctx.get("df")
+            try:
+                ind = quantum_indicators(df)
+            except Exception:
+                return self._sig(reason="no_indicators")
+            divs = ind.get("divs", 0)
+            rsi = ind.get("rsi", 50)
+            if not divs:
+                return self._sig(reason="no_divergence")
+            # RSI must confirm: bear div + overbought-quantile, bull div + oversold-quantile
+            rsi_hi = ind.get("rsi_hi", 70)
+            rsi_lo = ind.get("rsi_lo", 30)
+            side = 0
+            if divs < 0 and rsi >= rsi_hi:
+                side = -1
+            elif divs > 0 and rsi <= rsi_lo:
+                side = 1
+            else:
+                return self._sig(reason="rsi_no_confirm")
+            # Structure: SL beyond the divergence pivot
+            o, h, l, c = self._cols(ctx)
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else 1e-9
+            piv = max(h[-8:]) if side < 0 else min(l[-8:])
+            sl_atr = qclip(abs(c[-1] - piv) / (a + 1e-12) + 0.6, 1.0, 3.5)
+            feats = {"div": float(divs), "rsi": (rsi - 50) / 50}
+            try:
+                conf = quantum_calibrated_prob(feats)
+                tp_atr = qclip(quantum_expected_r(feats, side), 1.2, 5.0)
+            except Exception:
+                conf, tp_atr = 0.6, sl_atr * 1.6
+            return self._sig(side, conf, sl_atr, tp_atr, f"div{divs:+d} rsi{rsi:.0f}")
+        except Exception:
+            return self._sig(reason="error")
+
+
+class L2Suite:
+    """Performance-weighted strategy pool with regime routing + auto-parking."""
+
+    CLASSES = (AdaptiveTrendRider, AdaptiveBreakoutHunter, AdaptiveSwingCatcher,
+               AdaptiveScalpSniper, AdaptiveNewsSentinel, AdaptiveGridWeaver,
+               AdaptiveHedgeGuardian, AdaptiveRecoveryPilot, AdaptiveDivergenceSniper)
+
+    def __init__(self):
+        self.strats = [c() for c in self.CLASSES]
+        self.by_name = {s.name: s for s in self.strats}
+
+    def route(self, ctx):
+        """Run regime-suitable strategies, return ranked signals + pool vote."""
+        out = {"signals": [], "bias": 0.0, "conf": 0.0, "parked": [], "veto": None}
+        try:
+            regime = str(ctx.get("regime", "RANGE")).upper()
+            votes = []
+            for s in self.strats:
+                if s.stats.parked():
+                    out["parked"].append(s.name)
+                    continue
+                if not s.suitable(regime):
+                    continue
+                try:
+                    r = s.analyze(ctx)
+                except Exception:
+                    continue
+                if r.get("veto"):
+                    out["veto"] = f"{s.name}:{r.get('reason')}"
+                    return out
+                if r["side"] == 0 and "straddle" not in str(r.get("reason", "")) and "grid" not in s.name:
+                    continue
+                w = s.stats.weight()
+                r["weight"] = round(w, 3)
+                out["signals"].append(r)
+                votes.append((r["side"], r["conf"], w))
+            if votes:
+                tw = sum(w for _, _, w in votes) or 1.0
+                out["bias"] = sum(s * c * w for s, c, w in votes) / (tw * 1.0)
+                out["bias"] = float(qclip(out["bias"], -1, 1))
+                out["conf"] = float(qclip(sum(c * w for _, c, w in votes) / tw, 0, 1))
+                # Agreement boost
+                sides = [s for s, _, _ in votes]
+                if sides and all(x == sides[0] for x in sides):
+                    out["conf"] = min(1.0, out["conf"] + 0.1)
+            out["signals"].sort(key=lambda r: -(r["conf"] * r.get("weight", 0.5)))
+            return out
+        except Exception:
+            return out
+
+    def record(self, name, r):
+        try:
+            s = self.by_name.get(name)
+            if s is not None:
+                s.record(r)
+        except Exception:
+            pass
+
+    def leaderboard(self):
+        rows = []
+        for s in self.strats:
+            rows.append({"strategy": s.name, "n": s.stats.n,
+                         "win_rate": round(s.stats.win_rate, 3),
+                         "expectancy": round(s.stats.expectancy, 3),
+                         "weight": round(s.stats.weight(), 3),
+                         "parked": s.stats.parked()})
+        rows.sort(key=lambda r: -r["expectancy"])
+        return rows
+
+
+_L2_SINGLETON = {"obj": None}
+
+
+def l2_route(ctx):
+    try:
+        o = _L2_SINGLETON.get("obj")
+        if o is None:
+            o = L2Suite()
+            _L2_SINGLETON["obj"] = o
+        return o.route(ctx)
+    except Exception:
+        return {"signals": [], "bias": 0.0, "conf": 0.0, "parked": [], "veto": None}
+
+
+def l2_record(name, r):
+    try:
+        o = _L2_SINGLETON.get("obj")
+        if o is not None:
+            o.record(name, r)
+    except Exception:
+        pass
+
+
+def l2_leaderboard():
+    try:
+        o = _L2_SINGLETON.get("obj")
+        if o is None:
+            o = L2Suite()
+            _L2_SINGLETON["obj"] = o
+        return o.leaderboard()
+    except Exception:
+        return []
+
+
+# ----------------------------------------------------------------------------
+# L2 runtime discovery: find legacy v12 strategy instances by name pattern
+# ----------------------------------------------------------------------------
+
+def l2_discover_legacy(namespace=None):
+    """Scan a namespace (default globals) for legacy strategy-likes.
+
+    Returns {name: obj} for anything exposing analyze()/generate_signal()/
+    check_entry() — lets the quantum layer consult the old guard without
+    hard imports, and lets the audit prove what got replaced.
+    """
+    found = {}
+    try:
+        ns = namespace if namespace is not None else globals()
+        if not isinstance(ns, dict):
+            try:
+                ns = vars(ns)
+            except Exception:
+                return found
+        pats = ("strategy", "strategies", "scalp", "grid", "hedge",
+                "recovery", "straddle", "sentinel")
+        for k, v in ns.items():
+            try:
+                kl = str(k).lower()
+                if not any(p in kl for p in pats):
+                    continue
+                obj = v() if isinstance(v, type) else v
+                if any(callable(getattr(obj, m, None)) for m in
+                       ("analyze", "generate_signal", "check_entry", "evaluate",
+                        "should_enter", "signal", "run")):
+                    found[str(k)] = obj
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return found
+
+
+SECTION_L2_OK = True
