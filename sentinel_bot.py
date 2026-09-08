@@ -36491,3 +36491,497 @@ def quantum_profile_text():
 
 
 SECTION_CFG_OK = True
+
+# ============================================================================
+# EDGE — TIME & CROSS-MARKET EDGE PACK (seasonality, drift, futures expiry)
+# ----------------------------------------------------------------------------
+# Analyzers (stats) + 6 L2-contract strategies (pool grows to 21):
+#  16. AdaptiveOvernight   — overnight-vs-intraday drift harvest
+#  17. AdaptiveTurnOfMonth  — turn-of-month window rider
+#  18. AdaptiveDxyTide     — USD-tide headwind/tailwind sizer for XAU
+#  19. AdaptiveExpiryFade  — COMEX gold expiry-week spike fader
+#  20. AdaptiveSessionDrift — session-open drift follower (measured, not lore)
+#  21. AdaptiveDowBias     — day-of-week bias overlay (learned per symbol)
+# Every effect is MEASURED on the traded symbol — no textbook constants.
+# ============================================================================
+
+class _EdgeStats:
+    """Mean/t significance ledger for one effect bucket."""
+
+    def __init__(self):
+        self.l = []
+
+    def add(self, x):
+        try:
+            self.l.append(float(x))
+            del self.l[:-500]
+        except Exception:
+            pass
+
+    def t(self):
+        try:
+            import math as _m
+            n = len(self.l)
+            if n < 10:
+                return {"n": n, "sig": False}
+            mu = sum(self.l) / n
+            sd = (_m.fsum((x - mu) ** 2 for x in self.l) / n) ** 0.5 or 1e-9
+            tv = mu / (sd / _m.sqrt(n))
+            return {"n": n, "mean": round(mu, 5), "t": round(tv, 2),
+                    "sig": bool(abs(tv) > 2.0)}
+        except Exception:
+            return {"n": 0, "sig": False}
+
+
+class OvernightAnalyzer:
+    """Split returns into overnight (close->open) vs intraday (open->close)."""
+
+    def __init__(self):
+        self.on = _EdgeStats()
+        self.id = _EdgeStats()
+
+    def learn_bar(self, prev_close, o, c):
+        try:
+            if prev_close:
+                self.on.add((o - prev_close) / (prev_close + 1e-12))
+            self.id.add((c - o) / (o + 1e-12))
+        except Exception:
+            pass
+
+    def learn_df(self, df):
+        try:
+            o, c = qas_series(df, "open"), qas_series(df, "close")
+            for i in range(1, min(len(o), len(c))):
+                self.learn_bar(c[i - 1], o[i], c[i])
+        except Exception:
+            pass
+
+    def report(self):
+        return {"overnight": self.on.t(), "intraday": self.id.t()}
+
+
+class TurnOfMonthAnalyzer:
+    """Turn-of-month: last + first 3 trading days vs the rest."""
+
+    def __init__(self):
+        self.tom = _EdgeStats()
+        self.rest = _EdgeStats()
+
+    @staticmethod
+    def _is_tom(ts):
+        try:
+            import datetime as _dt
+            d = _dt.datetime.fromtimestamp(int(ts), tz=_dt.timezone.utc)
+            import calendar as _cal
+            last = _cal.monthrange(d.year, d.month)[1]
+            return d.day > last - 3 or d.day <= 3
+        except Exception:
+            return False
+
+    def learn_df(self, df):
+        try:
+            c = qas_series(df, "close")
+            t = qas_series(df, "time")
+            for i in range(1, len(c)):
+                r = (c[i] - c[i - 1]) / (c[i - 1] + 1e-12)
+                (self.tom if self._is_tom(t[i] if i < len(t) else 0) else self.rest).add(r)
+        except Exception:
+            pass
+
+    def report(self):
+        return {"tom": self.tom.t(), "rest": self.rest.t()}
+
+
+class DowAnalyzer:
+    """Day-of-week return stats (0=Mon..6=Sun UTC)."""
+
+    def __init__(self):
+        self.d = {i: _EdgeStats() for i in range(7)}
+
+    def learn_df(self, df):
+        try:
+            import datetime as _dt
+            c = qas_series(df, "close")
+            t = qas_series(df, "time")
+            for i in range(1, len(c)):
+                try:
+                    wd = _dt.datetime.fromtimestamp(int(t[i] if i < len(t) else 0),
+                                                    tz=_dt.timezone.utc).weekday()
+                except Exception:
+                    continue
+                self.d[wd].add((c[i] - c[i - 1]) / (c[i - 1] + 1e-12))
+        except Exception:
+            pass
+
+    def bias(self, now_ts=None):
+        try:
+            import time as _t
+            import datetime as _dt
+            wd = _dt.datetime.fromtimestamp(int(now_ts or _t.time()),
+                                            tz=_dt.timezone.utc).weekday()
+            st = self.d[wd].t()
+            if not st.get("sig"):
+                return {"bias": 0.0, "conf": 0.0, "dow": wd}
+            return {"bias": float(qclip(st["mean"] * 500, -1, 1)),
+                    "conf": 0.55, "dow": wd, "t": st["t"]}
+        except Exception:
+            return {"bias": 0.0, "conf": 0.0}
+
+
+class ExpiryAnalyzer:
+    """COMEX gold expiry-week behavior (approx rule: month's last 5 days).
+
+    Real expiry calendars vary; the analyzer LEARNS whether expiry weeks on
+    THIS feed show pin/fade behavior, and only then arms the fader.
+    """
+
+    def __init__(self):
+        self.exp = _EdgeStats()   # expiry-week daily range multiples
+        self.norm = _EdgeStats()
+
+    @staticmethod
+    def is_expiry_week(ts):
+        try:
+            import datetime as _dt
+            import calendar as _cal
+            d = _dt.datetime.fromtimestamp(int(ts), tz=_dt.timezone.utc)
+            return d.day > _cal.monthrange(d.year, d.month)[1] - 6
+        except Exception:
+            return False
+
+    def learn_df(self, df):
+        try:
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            c = qas_series(df, "close")
+            t = qas_series(df, "time")
+            for i in range(1, len(c)):
+                rng = (h[i] - l[i]) / (c[i - 1] + 1e-12)
+                (self.exp if self.is_expiry_week(t[i] if i < len(t) else 0)
+                 else self.norm).add(rng)
+        except Exception:
+            pass
+
+    def report(self):
+        return {"expiry": self.exp.t(), "normal": self.norm.t()}
+
+
+class TideAnalyzer:
+    """USD-tide: correlation of XAU against a USD-proxy series (DXY-like).
+
+    Feed any second close series (DXY, UUP, USD index CFD). Negative corr +
+    rising USD = headwind for longs (size down, not veto).
+    """
+
+    def __init__(self, window=60):
+        self.window = window
+        self.corr = 0.0
+        self.tide = 0.0
+
+    def update(self, closes_a, closes_b):
+        try:
+            a, b = list(closes_a)[-self.window:], list(closes_b)[-self.window:]
+            n = min(len(a), len(b))
+            if n < 20:
+                return {"corr": 0.0, "tide": 0.0}
+            a, b = a[-n:], b[-n:]
+            ma, mb = sum(a) / n, sum(b) / n
+            num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+            den = (sum((x - ma) ** 2 for x in a) * sum((y - mb) ** 2 for y in b)) ** 0.5 or 1e-12
+            self.corr = num / den
+            # Tide: USD-proxy 20-bar drift direction
+            self.tide = (b[-1] - b[-20]) / (b[-20] + 1e-12) if n >= 20 else 0.0
+            return {"corr": round(self.corr, 3), "tide": round(self.tide, 5)}
+        except Exception:
+            return {"corr": 0.0, "tide": 0.0}
+
+    def headwind(self, side):
+        """0..1 headwind against `side` (1=long XAU). Rising USD hurts longs."""
+        try:
+            if abs(self.corr) < 0.3 or self.tide == 0:
+                return 0.0
+            # USD up (tide>0) + neg corr => XAU pressured => headwind for longs
+            pressure = -self.corr * qsign(self.tide) * min(1.0, abs(self.tide) * 300)
+            hw = pressure * side  # >0 means against us
+            return float(qclip(hw, 0, 1))
+        except Exception:
+            return 0.0
+
+
+_EDGE_SINGLETONS = {}
+
+
+def _edge_get(kind, symbol="XAUUSD"):
+    try:
+        k = f"{kind}@{symbol}".upper()
+        o = _EDGE_SINGLETONS.get(k)
+        if o is None:
+            cls = {"overnight": OvernightAnalyzer, "tom": TurnOfMonthAnalyzer,
+                   "dow": DowAnalyzer, "expiry": ExpiryAnalyzer,
+                   "tide": TideAnalyzer}[kind]
+            o = cls()
+            _EDGE_SINGLETONS[k] = o
+        return o
+    except Exception:
+        return None
+
+
+def quantum_edge_overlay(symbol="XAUUSD", now_ts=None, usd_proxy_closes=None,
+                         my_closes=None):
+    """Combine all measured time/cross-market effects into one overlay.
+
+    Returns {bias(-1..1), size_mult(0..1), notes[]}. Never vetoes alone —
+    it leans size and direction at the margin, where seasonality belongs.
+    """
+    notes = []
+    bias, n = 0.0, 0
+    size_mult = 1.0
+    try:
+        sym = str(symbol).upper()
+        # DOW bias
+        try:
+            d = _edge_get("dow", sym).bias(now_ts)
+            if d["conf"] > 0:
+                bias += d["bias"] * 0.3
+                n += 1
+                notes.append(f"dow{d['dow']}:{d['bias']:+.2f}")
+        except Exception:
+            pass
+        # TOM proximity boost (informational)
+        try:
+            if TurnOfMonthAnalyzer._is_tom(now_ts or __import__("time").time()):
+                notes.append("turn_of_month_window")
+        except Exception:
+            pass
+        # Expiry week caution
+        try:
+            if ExpiryAnalyzer.is_expiry_week(now_ts or __import__("time").time()):
+                r = _edge_get("expiry", sym).report()
+                notes.append("expiry_week")
+                if (r.get("expiry", {}).get("mean") or 0) > (r.get("normal", {}).get("mean") or 0) * 1.3:
+                    size_mult *= 0.8
+                    notes.append("expiry_vol_high_sizex0.8")
+        except Exception:
+            pass
+        # USD tide headwind (needs proxy series)
+        try:
+            if usd_proxy_closes and my_closes:
+                td = _edge_get("tide", sym)
+                st = td.update(my_closes, usd_proxy_closes)
+                notes.append(f"tide_corr{st['corr']:+.2f}")
+                hw_long = td.headwind(1)
+                hw_short = td.headwind(-1)
+                if hw_long > 0.4:
+                    bias -= 0.2 * hw_long
+                    notes.append(f"usd_headwind_long{hw_long:.2f}")
+                if hw_short > 0.4:
+                    bias += 0.2 * hw_short
+                    notes.append(f"usd_headwind_short{hw_short:.2f}")
+        except Exception:
+            pass
+        bias = qclip(bias, -0.5, 0.5)
+        return {"bias": round(bias, 3), "size_mult": round(size_mult, 3),
+                "notes": notes}
+    except Exception:
+        return {"bias": 0.0, "size_mult": 1.0, "notes": notes}
+
+
+# ----------------------------------------------------------------------------
+# EDGE strategies 16-21 (L2 contract) — join the pool below
+# ----------------------------------------------------------------------------
+
+class AdaptiveOvernight(_L2Base):
+    name = "overnight"
+
+    def suitable(self, regime):
+        return regime in ("QUIET", "RANGE", "SESSION")
+
+    def analyze(self, ctx):
+        try:
+            df = ctx.get("df")
+            o = qas_series(df, "open")
+            c = qas_series(df, "close")
+            if len(c) < 100:
+                return self._sig(reason="warmup")
+            an = _edge_get("overnight", ctx.get("symbol", "XAUUSD"))
+            an.learn_df({"open": o[-200:], "close": c[-200:]})
+            rep = an.report()["overnight"]
+            if not rep.get("sig"):
+                return self._sig(reason="no_effect")
+            side = qsign(rep["mean"])
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else 1e-9
+            return self._sig(side, 0.52 + min(0.2, abs(rep["t"]) / 20), 2.2, 2.0,
+                             f"overnight_t{rep['t']:+.1f}", size_mult=0.5)
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveTurnOfMonth(_L2Base):
+    name = "turn_of_month"
+
+    def suitable(self, regime):
+        return regime in ("RANGE", "QUIET", "TREND_UP", "TREND_DOWN")
+
+    def analyze(self, ctx):
+        try:
+            import time as _t
+            if not TurnOfMonthAnalyzer._is_tom(ctx.get("now_ts") or _t.time()):
+                return self._sig(reason="not_tom")
+            df = ctx.get("df")
+            c = qas_series(df, "close")
+            if len(c) < 60:
+                return self._sig(reason="warmup")
+            an = _edge_get("tom", ctx.get("symbol", "XAUUSD"))
+            try:
+                an.learn_df(df)
+            except Exception:
+                pass
+            rep = an.report()["tom"]
+            if not rep.get("sig"):
+                return self._sig(reason="no_effect")
+            side = qsign(rep["mean"])
+            return self._sig(side, 0.55, 2.0, 2.5, f"tom_t{rep['t']:+.1f}",
+                             size_mult=0.6)
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveDxyTide(_L2Base):
+    name = "dxy_tide"
+
+    def suitable(self, regime):
+        return True
+
+    def analyze(self, ctx):
+        try:
+            proxy = ctx.get("usd_proxy_closes")
+            df = ctx.get("df")
+            c = qas_series(df, "close")
+            if not proxy or len(c) < 60:
+                return self._sig(reason="no_proxy")
+            td = _edge_get("tide", ctx.get("symbol", "XAUUSD"))
+            st = td.update(c, proxy)
+            if abs(st["corr"]) < 0.4:
+                return self._sig(reason="decorrelated")
+            # Trade WITH the implied XAU pressure (tide-following, small)
+            press = -st["corr"] * qsign(st["tide"]) if st["tide"] != 0 else 0
+            if abs(press) < 0.15:
+                return self._sig(reason="slack_tide")
+            side = qsign(press)
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else 1e-9
+            return self._sig(side, 0.5 + min(0.25, abs(press) / 3), 1.8, 2.2,
+                             f"tide{press:+.2f}_corr{st['corr']:+.2f}",
+                             size_mult=0.5)
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveExpiryFade(_L2Base):
+    name = "expiry_fade"
+
+    def suitable(self, regime):
+        return regime in ("VOLATILE", "RANGE", "SESSION")
+
+    def analyze(self, ctx):
+        try:
+            import time as _t
+            if not ExpiryAnalyzer.is_expiry_week(ctx.get("now_ts") or _t.time()):
+                return self._sig(reason="not_expiry")
+            o, h, l, c = self._cols(ctx)
+            if len(c) < 60:
+                return self._sig(reason="warmup")
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else 1e-9
+            # Fade the spike: today's range > 2x median + long wick + stall
+            rngs = sorted(h[i] - l[i] for i in range(-21, -1))
+            med = rngs[len(rngs) // 2] or 1e-9
+            if (h[-1] - l[-1]) / med < 2.0:
+                return self._sig(reason="no_spike")
+            up_wick = (h[-1] - max(c[-1], o[-1])) / (a + 1e-12)
+            dn_wick = (min(c[-1], o[-1]) - l[-1]) / (a + 1e-12)
+            if max(up_wick, dn_wick) < 0.8:
+                return self._sig(reason="no_rejection")
+            side = -1 if up_wick > dn_wick else 1
+            return self._sig(side, 0.58, 1.5, 2.0, "expiry_spike_fade",
+                             size_mult=0.6)
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveSessionDrift(_L2Base):
+    name = "session_drift"
+
+    def suitable(self, regime):
+        return regime in ("SESSION", "VOLATILE", "RANGE")
+
+    def analyze(self, ctx):
+        try:
+            sess = str(ctx.get("session", "")).upper()
+            if sess in ("OFF", "UNKNOWN", ""):
+                return self._sig(reason="no_session")
+            o, h, l, c = self._cols(ctx)
+            if len(c) < 40:
+                return self._sig(reason="warmup")
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else 1e-9
+            # First-hour drift persistence: drift of last 12 bars continues?
+            drift = (c[-1] - c[-12]) / (a + 1e-12)
+            if abs(drift) < 0.8:
+                return self._sig(reason="no_drift")
+            # Confirm: pullback stayed shallow (last 3 bars didn't retrace 50%)
+            retr = abs(c[-1] - max(c[-3:])) / (abs(drift) * a + 1e-12) if drift > 0 else \
+                abs(c[-1] - min(c[-3:])) / (abs(drift) * a + 1e-12)
+            if retr > 0.5:
+                return self._sig(reason="deep_pullback")
+            side = qsign(drift)
+            return self._sig(side, 0.55 + min(0.2, abs(drift) / 10), 1.6, 2.4,
+                             f"sess{sess}_drift{drift:+.1f}a")
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveDowBias(_L2Base):
+    name = "dow_bias"
+
+    def suitable(self, regime):
+        return regime in ("RANGE", "QUIET", "TREND_UP", "TREND_DOWN")
+
+    def analyze(self, ctx):
+        try:
+            import time as _t
+            an = _edge_get("dow", ctx.get("symbol", "XAUUSD"))
+            try:
+                an.learn_df(ctx.get("df"))
+            except Exception:
+                pass
+            d = an.bias(ctx.get("now_ts") or _t.time())
+            if d["conf"] <= 0:
+                return self._sig(reason="no_effect")
+            return self._sig(qsign(d["bias"]), 0.52, 2.0, 2.0,
+                             f"dow{d['dow']}_t{d.get('t', 0):+.1f}",
+                             size_mult=0.4)
+        except Exception:
+            return self._sig(reason="error")
+
+
+_L2C_CLASSES = (AdaptiveOvernight, AdaptiveTurnOfMonth, AdaptiveDxyTide,
+                AdaptiveExpiryFade, AdaptiveSessionDrift, AdaptiveDowBias)
+
+try:
+    L2Suite.CLASSES = tuple(L2Suite.CLASSES) + _L2C_CLASSES
+    if _L2_SINGLETON.get("obj") is not None:
+        _keep_stats = {s.name: s.stats for s in _L2_SINGLETON["obj"].strats}
+        _L2_SINGLETON["obj"] = L2Suite()
+        for _s in _L2_SINGLETON["obj"].strats:
+            if _s.name in _keep_stats:
+                _s.stats = _keep_stats[_s.name]
+except Exception:
+    pass
+
+SECTION_EDGE_OK = True
