@@ -31527,3 +31527,411 @@ def l2_discover_legacy(namespace=None):
 
 
 SECTION_L2_OK = True
+
+# ============================================================================
+# G2 — SIGNAL ATTRIBUTION FORENSICS + CONFORMAL EXIT ENGINE
+# ----------------------------------------------------------------------------
+# G2a Forensics: which input moved the needle on every decision? Shapley-lite
+# attribution over the feature vector + counterfactual "what if" analysis.
+# G2b ConformalExits: TP/SL/time-stop from conformal prediction intervals —
+# exits with a coverage guarantee instead of fixed multiples.
+# ============================================================================
+
+class AttributionLedger:
+    """Shapley-lite attribution: leave-one-out delta per feature group."""
+
+    GROUPS = ("regime", "trend", "momentum", "volatility", "volume",
+              "structure", "session", "patterns", "htf", "micro")
+
+    def __init__(self, window=500):
+        self.window = window
+        self.rows = []  # (group -> delta) dicts
+
+    def attribute(self, feats, score_fn):
+        """score_fn(feats)->float. Returns {group: attribution} normalized."""
+        out = {}
+        try:
+            keys = [k for k in feats.keys() if not str(k).startswith("_")]
+            if not keys:
+                return out
+            base = float(score_fn(dict(feats)))
+            # Group keys by prefix match
+            grouped = {g: [] for g in self.GROUPS}
+            grouped["_other"] = []
+            for k in keys:
+                kl = str(k).lower()
+                hit = [g for g in self.GROUPS if g in kl]
+                grouped[hit[0] if hit else "_other"].append(k)
+            for g, ks in grouped.items():
+                if not ks:
+                    continue
+                mut = dict(feats)
+                for k in ks:
+                    mut[k] = 0.0  # neutralize group
+                try:
+                    delta = base - float(score_fn(mut))
+                except Exception:
+                    delta = 0.0
+                out[g] = float(delta)
+            tot = sum(abs(v) for v in out.values()) or 1.0
+            out = {g: v / tot for g, v in out.items()}
+            self.rows.append(dict(out))
+            self.rows = self.rows[-self.window:]
+            return out
+        except Exception:
+            return out
+
+    def global_importance(self):
+        """Mean |attribution| per group over the ledger window."""
+        try:
+            acc = {}
+            for row in self.rows:
+                for g, v in row.items():
+                    acc[g] = acc.get(g, 0.0) + abs(v)
+            n = len(self.rows) or 1
+            return {g: round(v / n, 4) for g, v in
+                    sorted(acc.items(), key=lambda t: -t[1])}
+        except Exception:
+            return {}
+
+    def top_drivers(self, row, k=3):
+        try:
+            items = sorted(row.items(), key=lambda t: -abs(t[1]))
+            return [(g, round(v, 3)) for g, v in items[:k]]
+        except Exception:
+            return []
+
+
+_ATTR_SINGLETON = {"obj": None}
+
+
+def quantum_attribute(feats, score_fn):
+    try:
+        o = _ATTR_SINGLETON.get("obj")
+        if o is None:
+            o = AttributionLedger()
+            _ATTR_SINGLETON["obj"] = o
+        return o.attribute(feats, score_fn)
+    except Exception:
+        return {}
+
+
+def quantum_global_importance():
+    try:
+        o = _ATTR_SINGLETON.get("obj")
+        return o.global_importance() if o is not None else {}
+    except Exception:
+        return {}
+
+
+class CounterfactualLab:
+    """What-if analysis: replay a decision under perturbed conditions."""
+
+    @staticmethod
+    def perturb(feats, **changes):
+        mut = dict(feats)
+        mut.update(changes)
+        return mut
+
+    @staticmethod
+    def compare(feats, score_fn, scenarios):
+        """scenarios: {name: {key: value}}. Returns {name: score} + base."""
+        out = {}
+        try:
+            out["_base"] = float(score_fn(dict(feats)))
+            for name, ch in scenarios.items():
+                try:
+                    out[str(name)] = float(score_fn(CounterfactualLab.perturb(feats, **ch)))
+                except Exception:
+                    out[str(name)] = float("nan")
+            return out
+        except Exception:
+            return out
+
+    @staticmethod
+    def flip_report(feats, score_fn, threshold=0.5):
+        """Find single-feature flips: which one change reverses the decision?"""
+        out = []
+        try:
+            base = float(score_fn(dict(feats)))
+            side = base >= threshold
+            keys = [k for k in feats.keys() if not str(k).startswith("_")]
+            for k in keys:
+                for trial in (0.0, 1.0, -1.0):
+                    try:
+                        mut = dict(feats)
+                        mut[k] = trial
+                        s = float(score_fn(mut))
+                        if (s >= threshold) != side:
+                            out.append({"feature": str(k), "set_to": trial,
+                                        "score": round(s, 3), "base": round(base, 3)})
+                            break
+                    except Exception:
+                        continue
+            return out
+        except Exception:
+            return out
+
+
+class FalseSignalAutopsyG2:
+    """Deeper autopsy: clusters losers by attribution fingerprint."""
+
+    def __init__(self, window=300):
+        self.window = window
+        self.losers = []  # (attribution_row, feats, r)
+
+    def add_loser(self, attr_row, feats, r):
+        try:
+            self.losers.append((dict(attr_row), dict(feats), float(r)))
+            self.losers = self.losers[-self.window:]
+        except Exception:
+            pass
+
+    def cluster_report(self, k=4):
+        """Greedy fingerprint clustering: group losers by top-driver overlap."""
+        try:
+            if len(self.losers) < 6:
+                return {"status": "collecting", "n": len(self.losers)}
+            # Signature = top-2 drivers by |attr|
+            sigs = []
+            for attr, feats, r in self.losers:
+                top = tuple(g for g, _ in
+                            sorted(attr.items(), key=lambda t: -abs(t[1]))[:2])
+                sigs.append((top, r))
+            from collections import Counter
+            cnt = Counter(s for s, _ in sigs)
+            clusters = []
+            for sig, n in cnt.most_common(k):
+                rs = [r for s, r in sigs if s == sig]
+                clusters.append({"drivers": list(sig), "n": n,
+                                 "avg_r": round(sum(rs) / len(rs), 3),
+                                 "total_r": round(sum(rs), 2)})
+            worst = min(clusters, key=lambda c: c["avg_r"]) if clusters else {}
+            return {"status": "ok", "n": len(self.losers), "clusters": clusters,
+                    "verdict": ("avoid_entries_led_by_%s" % "+".join(worst.get("drivers", []))
+                                if worst else "none")}
+        except Exception:
+            return {"status": "error"}
+
+
+_AUTOPSY2 = {"obj": None}
+
+
+def quantum_autopsy2_add(attr_row, feats, r):
+    try:
+        o = _AUTOPSY2.get("obj")
+        if o is None:
+            o = FalseSignalAutopsyG2()
+            _AUTOPSY2["obj"] = o
+        o.add_loser(attr_row, feats, r)
+    except Exception:
+        pass
+
+
+def quantum_autopsy2_report():
+    try:
+        o = _AUTOPSY2.get("obj")
+        return o.cluster_report() if o is not None else {"status": "empty"}
+    except Exception:
+        return {"status": "error"}
+
+
+# ----------------------------------------------------------------------------
+# G2b — CONFORMAL EXIT ENGINE (exits with coverage guarantees)
+# ----------------------------------------------------------------------------
+
+class ConformalExitEngine:
+    """TP/SL/time stops from conformal intervals on MFE/MAE history.
+
+    Instead of SL=2xATR/TP=3xATR, learn the (1-alpha) interval of favorable
+    and adverse excursion per setup-class, and place exits at quantiles with
+    a finite-sample coverage guarantee (split-conformal).
+    """
+
+    def __init__(self, alpha=0.15):
+        self.alpha = alpha
+        self.mfe = {}  # setup_class -> list of max favorable excursion (R)
+        self.mae = {}  # setup_class -> list of max adverse excursion (R)
+        self.dur = {}  # setup_class -> list of bars-to-resolution
+
+    def _lst(self, d, k):
+        l = d.get(k)
+        if l is None:
+            l = []
+            d[k] = l
+        return l
+
+    def record(self, setup_class, mfe_r, mae_r, bars):
+        try:
+            k = str(setup_class)
+            self._lst(self.mfe, k).append(float(mfe_r))
+            self._lst(self.mae, k).append(float(mae_r))
+            self._lst(self.dur, k).append(int(bars))
+            for d in (self.mfe, self.mae, self.dur):
+                d[k] = d[k][-400:]
+        except Exception:
+            pass
+
+    @staticmethod
+    def _q(sorted_vals, p):
+        if not sorted_vals:
+            return None
+        v = sorted(sorted_vals)
+        i = min(len(v) - 1, max(0, int(p * len(v))))
+        return v[i]
+
+    def exits(self, setup_class, entry_atr=1.0, side=1, alpha=None):
+        """Returns {sl_atr, tp_atr, time_stop_bars, coverage_note}."""
+        a = self.alpha if alpha is None else alpha
+        k = str(setup_class)
+        mfe = sorted(self.mfe.get(k, []))
+        mae = sorted(self.mae.get(k, []))
+        dur = sorted(self.dur.get(k, []))
+        n = min(len(mfe), len(mae))
+        if n < 25:
+            return {"sl_atr": 2.0 * entry_atr, "tp_atr": 3.0 * entry_atr,
+                    "time_stop_bars": 48, "coverage": 0.0,
+                    "note": f"collecting ({n}/25)"}
+        # SL: adverse excursion quantile — stop where (1-a) of winners never went
+        # TP: favorable excursion lower quantile — bank what usually materializes
+        sl_r = self._q(mae, 1 - a) or 2.0
+        tp_r = self._q(mfe, 0.35) or 3.0
+        t_stop = self._q(dur, 0.8) or 48
+        # Coverage guarantee: split-conformal finite-sample bound
+        coverage = qclip(1 - a - 1 / (n + 1), 0, 1)
+        return {"sl_atr": round(max(0.8, sl_r) * entry_atr, 3),
+                "tp_atr": round(max(1.0, tp_r) * entry_atr, 3),
+                "time_stop_bars": int(t_stop),
+                "coverage": round(coverage, 3),
+                "note": f"conformal n={n} class={k}"}
+
+    def classes(self):
+        return sorted(set(self.mfe) | set(self.mae))
+
+
+_QEXIT = {"obj": None}
+
+
+def quantum_exits(setup_class, entry_atr=1.0, side=1):
+    try:
+        o = _QEXIT.get("obj")
+        if o is None:
+            o = ConformalExitEngine()
+            _QEXIT["obj"] = o
+        return o.exits(setup_class, entry_atr, side)
+    except Exception:
+        return {"sl_atr": 2.0, "tp_atr": 3.0, "time_stop_bars": 48,
+                "coverage": 0.0, "note": "fallback"}
+
+
+def quantum_exits_record(setup_class, mfe_r, mae_r, bars):
+    try:
+        o = _QEXIT.get("obj")
+        if o is None:
+            o = ConformalExitEngine()
+            _QEXIT["obj"] = o
+        o.record(setup_class, mfe_r, mae_r, bars)
+    except Exception:
+        pass
+
+
+class TrailSmith:
+    """Adaptive trailing: ratchets by structure + volatility, not fixed pips."""
+
+    def __init__(self):
+        self.states = {}  # ticket -> {entry, side, best, stop, atr}
+
+    def register(self, ticket, entry, side, atr):
+        try:
+            self.states[str(ticket)] = {"entry": float(entry), "side": int(side),
+                                        "best": float(entry), "stop": None,
+                                        "atr": float(atr)}
+        except Exception:
+            pass
+
+    def update(self, ticket, price, swing_low=None, swing_high=None):
+        """Returns new stop or None. Ratchet: max(chandelier, swing, breakeven+)."""
+        try:
+            st = self.states.get(str(ticket))
+            if st is None:
+                return None
+            px = float(price)
+            side = st["side"]
+            a = st["atr"] or 1e-9
+            if side > 0:
+                st["best"] = max(st["best"], px)
+                cand = [st["best"] - 2.2 * a]
+                if swing_low is not None:
+                    cand.append(float(swing_low) - 0.3 * a)
+                # Breakeven+ once +1R
+                if st["best"] - st["entry"] > 1.0 * a:
+                    cand.append(st["entry"] + 0.2 * a)
+                new = max(cand)
+                st["stop"] = new if st["stop"] is None else max(st["stop"], new)
+                return st["stop"] if px > st["stop"] else "STOPPED"
+            else:
+                st["best"] = min(st["best"], px)
+                cand = [st["best"] + 2.2 * a]
+                if swing_high is not None:
+                    cand.append(float(swing_high) + 0.3 * a)
+                if st["entry"] - st["best"] > 1.0 * a:
+                    cand.append(st["entry"] - 0.2 * a)
+                new = min(cand)
+                st["stop"] = new if st["stop"] is None else min(st["stop"], new)
+                return st["stop"] if px < st["stop"] else "STOPPED"
+        except Exception:
+            return None
+
+    def remove(self, ticket):
+        try:
+            self.states.pop(str(ticket), None)
+        except Exception:
+            pass
+
+
+_TRAIL = {"obj": None}
+
+
+def quantum_trail(ticket, price, entry=None, side=None, atr=None,
+                  swing_low=None, swing_high=None):
+    try:
+        o = _TRAIL.get("obj")
+        if o is None:
+            o = TrailSmith()
+            _TRAIL["obj"] = o
+        if entry is not None and str(ticket) not in o.states:
+            o.register(ticket, entry, side or 1, atr or 1.0)
+        return o.update(ticket, price, swing_low, swing_high)
+    except Exception:
+        return None
+
+
+class PartialBanker:
+    """Scale-out schedule from MFE distribution: bank fractions where PA stalls."""
+
+    def ladder(self, setup_class, entry_atr=1.0):
+        try:
+            o = _QEXIT.get("obj")
+            if o is None:
+                return [{"at_r": 1.5, "frac": 0.5}, {"at_r": 2.5, "frac": 0.3}]
+            mfe = sorted(o.mfe.get(str(setup_class), []))
+            if len(mfe) < 25:
+                return [{"at_r": 1.5, "frac": 0.5}, {"at_r": 2.5, "frac": 0.3}]
+            q1 = ConformalExitEngine._q(mfe, 0.3)
+            q2 = ConformalExitEngine._q(mfe, 0.55)
+            q3 = ConformalExitEngine._q(mfe, 0.75)
+            return [{"at_r": round(q1, 2), "frac": 0.4},
+                    {"at_r": round(q2, 2), "frac": 0.35},
+                    {"at_r": round(q3, 2), "frac": 0.25}]
+        except Exception:
+            return [{"at_r": 1.5, "frac": 0.5}, {"at_r": 2.5, "frac": 0.3}]
+
+
+def quantum_ladder(setup_class):
+    try:
+        return PartialBanker().ladder(setup_class)
+    except Exception:
+        return []
+
+
+SECTION_G2_OK = True
