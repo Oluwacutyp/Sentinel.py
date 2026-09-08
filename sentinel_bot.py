@@ -35476,3 +35476,706 @@ except SystemExit:
     raise
 except Exception as _qe:
     print(f"quantum trailer: {_qe}")
+
+# ============================================================================
+# N2 — NEWS INTELLIGENCE PACK (events as data, not fear)
+# ----------------------------------------------------------------------------
+# N2a CalendarStore    CSV/API calendar ingest + normalization
+# N2b EventTagger      auto-classify events (tier, currency, type)
+# N2c PreNewsDrift     does price drift into this event class? (stats)
+# N2d PostNewsFollow   follow-through / reversal stats per class
+# N2e NewsState        live state builder for ctx["news_state"]
+# Facade: quantum_news_state(ts, calendar) -> news_state dict
+# ============================================================================
+
+class CalendarStore:
+    """Ingest an economic calendar from CSV or dict rows.
+
+    Canonical row: {ts (epoch), currency, title, impact (high/medium/low),
+    forecast, previous}. Accepts ForexFactory-style CSVs with fuzzy headers.
+    """
+
+    HEADER_MAP = {"date": "date", "time": "time", "datetime": "ts", "timestamp": "ts",
+                  "currency": "currency", "curr": "currency", "country": "currency",
+                  "event": "title", "title": "title", "announcement": "title",
+                  "impact": "impact", "priority": "impact", "forecast": "forecast",
+                  "previous": "previous", "actual": "actual"}
+
+    def __init__(self):
+        self.events = []  # sorted canonical dicts
+
+    def load_csv(self, path):
+        try:
+            import csv as _csv
+            import datetime as _dt
+            rows = []
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                rd = _csv.DictReader(f)
+                cols = {(c or "").strip().lower(): c for c in (rd.fieldnames or [])}
+                for r in rd:
+                    try:
+                        g = {k: (r.get(cols.get(k, ""), "") or "").strip()
+                             for k in ("ts", "date", "time", "currency", "title",
+                                       "impact", "forecast", "previous")}
+                        # Also try raw header names
+                        if not g["title"]:
+                            for hk, col in cols.items():
+                                if hk in self.HEADER_MAP and self.HEADER_MAP[hk] == "title":
+                                    g["title"] = (r.get(col) or "").strip()
+                        if not g["title"]:
+                            continue
+                        ts = self._parse_ts(g, r, cols)
+                        if ts is None:
+                            continue
+                        cur = g.get("currency", "") or ""
+                        if not cur:
+                            for hk, col in cols.items():
+                                if hk in self.HEADER_MAP and self.HEADER_MAP[hk] == "currency":
+                                    cur = (r.get(col) or "").strip()
+                                    break
+                        imp = (g.get("impact", "") or "medium").lower()
+                        if imp not in ("high", "medium", "low"):
+                            imp = "high" if imp in ("3", "h", "***") else (
+                                "medium" if imp in ("2", "m", "**") else "low")
+                        rows.append({"ts": ts, "currency": cur.upper()[:3] or "USD",
+                                     "title": g["title"], "impact": imp,
+                                     "forecast": g.get("forecast", ""),
+                                     "previous": g.get("previous", "")})
+                    except Exception:
+                        continue
+            rows.sort(key=lambda e: e["ts"])
+            self.events = rows
+            return {"status": "ok", "n": len(rows)}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    @staticmethod
+    def _parse_ts(g, raw, cols):
+        try:
+            import datetime as _dt
+            for key in ("ts", "datetime", "timestamp"):
+                v = (raw.get(cols.get(key, ""), "") or "").strip()
+                if v:
+                    try:
+                        return int(float(v))
+                    except Exception:
+                        pass
+                    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%m/%d/%Y %H:%M",
+                                "%Y-%m-%d", "%m/%d/%Y", "%Y.%m.%d %H:%M"):
+                        try:
+                            return int(_dt.datetime.strptime(v, fmt).replace(
+                                tzinfo=_dt.timezone.utc).timestamp())
+                        except Exception:
+                            continue
+            d = (g.get("date", "") or "").strip()
+            t = (g.get("time", "") or "").strip()
+            if d:
+                for fmt in ("%Y-%m-%d %H:%M", "%m/%d/%Y %H:%M", "%Y-%m-%d",
+                            "%m/%d/%Y", "%Y.%m.%d"):
+                    try:
+                        return int(_dt.datetime.strptime(
+                            f"{d} {t}" if t else d, fmt).replace(
+                            tzinfo=_dt.timezone.utc).timestamp())
+                    except Exception:
+                        continue
+            return None
+        except Exception:
+            return None
+
+    def load_rows(self, rows):
+        try:
+            ev = []
+            for r in rows or []:
+                ev.append({"ts": int(r["ts"]), "currency": str(r.get("currency", "USD")).upper()[:3],
+                           "title": str(r.get("title", "?")), "impact": str(r.get("impact", "medium")).lower(),
+                           "forecast": str(r.get("forecast", "")), "previous": str(r.get("previous", ""))})
+            ev.sort(key=lambda e: e["ts"])
+            self.events = ev
+            return {"status": "ok", "n": len(ev)}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def window(self, ts, before_min=60, after_min=60, currencies=("USD", "XAU")):
+        """Events within [ts-before, ts+after] for relevant currencies."""
+        try:
+            lo, hi = ts - before_min * 60, ts + after_min * 60
+            cur = {str(c).upper()[:3] for c in (currencies or ())}
+            cur |= {"USD", "ALL"}
+            return [e for e in self.events if lo <= e["ts"] <= hi and
+                    (e["currency"] in cur or "XAU" in cur and e["currency"] == "USD")]
+        except Exception:
+            return []
+
+    def next_after(self, ts, currencies=("USD",)):
+        try:
+            cur = {str(c).upper()[:3] for c in (currencies or ())} | {"USD"}
+            for e in self.events:
+                if e["ts"] >= ts and e["currency"] in cur:
+                    return e
+            return None
+        except Exception:
+            return None
+
+
+class EventTagger:
+    """Auto-classify events into tradeable classes.
+
+    Classes: rates, cpi, jobs, gdp, pmi, consumer, housing, trade, energy,
+    central_speak, minutes, retail, sentiment, other. Tier from impact.
+    """
+
+    RULES = (
+        ("rates", ("rate decision", "interest rate", "fomc", "ecb press", "boe ")),
+        ("cpi", ("cpi", "inflation", "ppi", "pce ")),
+        ("jobs", ("nfp", "non-farm", "nonfarm", "unemployment", "jobless", "payroll", "adp")),
+        ("gdp", ("gdp", "growth")),
+        ("pmi", ("pmi", "ism manufacturing", "ism services")),
+        ("consumer", ("consumer", "confidence", "sentiment", "michigan")),
+        ("retail", ("retail sales",)),
+        ("housing", ("housing", "building permits", "home sales", "case-shiller")),
+        ("trade", ("trade balance", "current account")),
+        ("energy", ("crude", "inventories", "opec", "gas storage")),
+        ("central_speak", ("powell", "lagarde", "bailey", "speech", "testimony", "press conference")),
+        ("minutes", ("minutes", "meeting minutes")),
+    )
+
+    @classmethod
+    def tag(cls, title, impact="medium"):
+        try:
+            t = str(title).lower()
+            for klass, keys in cls.RULES:
+                if any(k in t for k in keys):
+                    return f"{klass}:{impact}"
+            return f"other:{impact}"
+        except Exception:
+            return "other:medium"
+
+    @classmethod
+    def relevant_for(cls, klass, symbol="XAUUSD"):
+        """USD events move XAU; tag-gate per symbol family."""
+        try:
+            s = str(symbol).upper()
+            if "XAU" in s or "BTC" in s:
+                return True  # macro-driven; everything matters
+            base = s[:3]
+            return True  # conservative default: respect all scheduled risk
+        except Exception:
+            return True
+
+
+class PreNewsDrift:
+    """Stat: does price drift INTO this event class (positioning drift)?"""
+
+    def __init__(self):
+        self.samples = {}  # klass -> [drift_atr...] (signed, pre-window)
+
+    def add(self, klass, drift_atr):
+        try:
+            self.samples.setdefault(str(klass), []).append(float(drift_atr))
+        except Exception:
+            pass
+
+    def report(self, klass):
+        try:
+            l = self.samples.get(str(klass), [])
+            if len(l) < 8:
+                return {"status": "collecting", "n": len(l)}
+            import math as _m
+            mu = sum(l) / len(l)
+            sd = (_m.fsum((x - mu) ** 2 for x in l) / len(l)) ** 0.5 or 1e-9
+            t = mu / (sd / _m.sqrt(len(l)))
+            return {"status": "ok", "n": len(l), "mean_atr": round(mu, 3),
+                    "t": round(t, 2),
+                    "verdict": ("drifts_up" if t > 2 else "drifts_down" if t < -2 else "no_drift")}
+        except Exception:
+            return {"status": "error"}
+
+
+class PostNewsFollow:
+    """Stat: follow-through vs reversal after the spike, per class."""
+
+    def __init__(self):
+        self.samples = {}  # klass -> [(spike_dir, follow_r)]
+
+    def add(self, klass, spike_dir, follow_r):
+        try:
+            self.samples.setdefault(str(klass), []).append((int(spike_dir), float(follow_r)))
+        except Exception:
+            pass
+
+    def report(self, klass):
+        try:
+            l = self.samples.get(str(klass), [])
+            if len(l) < 8:
+                return {"status": "collecting", "n": len(l)}
+            # Follow-through: spike_dir * follow_r > 0
+            ft = sum(1 for d, r in l if d * r > 0.2) / len(l)
+            ev = sum(d * r for d, r in l) / len(l)
+            return {"status": "ok", "n": len(l),
+                    "follow_rate": round(ft, 3), "ev_r": round(ev, 3),
+                    "verdict": ("follow" if ft > 0.6 and ev > 0.1 else
+                                "fade" if ft < 0.4 and ev < -0.05 else "mixed")}
+        except Exception:
+            return {"status": "error"}
+
+
+_NEWSLAB = {"drift": None, "follow": None, "cal": None}
+
+
+def _newslab():
+    try:
+        if _NEWSLAB["drift"] is None:
+            _NEWSLAB["drift"] = PreNewsDrift()
+            _NEWSLAB["follow"] = PostNewsFollow()
+            _NEWSLAB["cal"] = CalendarStore()
+        return _NEWSLAB["drift"], _NEWSLAB["follow"], _NEWSLAB["cal"]
+    except Exception:
+        return PreNewsDrift(), PostNewsFollow(), CalendarStore()
+
+
+def quantum_news_calendar_load(path_or_rows):
+    try:
+        _, _, cal = _newslab()
+        if isinstance(path_or_rows, str):
+            return cal.load_csv(path_or_rows)
+        return cal.load_rows(path_or_rows)
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def quantum_news_state(now_ts=None, symbol="XAUUSD"):
+    """Build ctx['news_state']: {mins_to_event, event_class, title, impact}."""
+    try:
+        import time as _t
+        now = int(now_ts or _t.time())
+        _, _, cal = _newslab()
+        if not cal.events:
+            return {}
+        cur = "USD"
+        e = cal.next_after(now - 30 * 60, currencies=(cur,))
+        if e is None:
+            return {}
+        mins = (e["ts"] - now) / 60
+        if abs(mins) > 180:
+            return {}
+        klass = EventTagger.tag(e["title"], e["impact"]).split(":")[0]
+        return {"mins_to_event": round(mins, 1), "event_class": klass,
+                "title": e["title"], "impact": e["impact"],
+                "currency": e["currency"]}
+    except Exception:
+        return {}
+
+
+def quantum_news_learn_fill(klass, drift_atr=None, spike_dir=None, follow_r=None):
+    try:
+        drift, follow, _ = _newslab()
+        if drift_atr is not None:
+            drift.add(klass, drift_atr)
+        if spike_dir is not None and follow_r is not None:
+            follow.add(klass, spike_dir, follow_r)
+        return True
+    except Exception:
+        return False
+
+
+def quantum_news_class_report(klass):
+    try:
+        drift, follow, _ = _newslab()
+        return {"class": klass, "pre_drift": drift.report(klass),
+                "post": follow.report(klass)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+SECTION_N2_OK = True
+
+# ============================================================================
+# J2 — ADVANCED RISK PACK (stay alive first, get rich second)
+# ----------------------------------------------------------------------------
+# J2a DrawdownShield  CPPI-lite: risk budget shrinks as DD deepens (floor-safe)
+# J2b VolTarget       volatility targeting overlay (constant-risk scaling)
+# J2c PortfolioHeat   correlation-adjusted heat across all open risk
+# J2d StreakManager   win/loss-streak sizing (press winners, starve losers)
+# J2e GapGuard        weekend/event gap exposure limiter
+# J2f RiskStack       one call composing EVERY governor into a final size
+# ============================================================================
+
+class DrawdownShield:
+    """CPPI-lite cushion shield: equity above the floor funds risk.
+
+    floor = peak * (1 - max_dd). cushion = equity - floor.
+    risk_mult = clip(cushion / (peak * max_dd), 0, 1) ^ power.
+    At the floor: zero new risk. No exceptions, no revenge.
+    """
+
+    def __init__(self, max_dd_frac=0.15, power=1.5):
+        self.max_dd = max_dd_frac
+        self.power = power
+        self.peak = None
+
+    def update(self, equity):
+        try:
+            e = float(equity)
+            self.peak = e if self.peak is None else max(self.peak, e)
+            floor = self.peak * (1 - self.max_dd)
+            cushion = e - floor
+            if cushion <= 0:
+                return {"mult": 0.0, "state": "FLOOR", "dd_frac": round(1 - e / (self.peak or 1), 4)}
+            raw = cushion / (self.peak * self.max_dd + 1e-12)
+            mult = qclip(raw, 0, 1) ** self.power
+            dd = 1 - e / (self.peak or 1)
+            state = "FULL" if dd < self.max_dd * 0.3 else ("REDUCED" if dd < self.max_dd * 0.7 else "CRITICAL")
+            return {"mult": round(mult, 3), "state": state,
+                    "dd_frac": round(dd, 4), "floor": round(floor, 2)}
+        except Exception:
+            return {"mult": 0.5, "state": "UNKNOWN"}
+
+
+_DDSHIELD = {"obj": None}
+
+
+def quantum_ddshield(equity, max_dd_frac=0.15):
+    try:
+        o = _DDSHIELD.get("obj")
+        if o is None or abs(o.max_dd - max_dd_frac) > 1e-9:
+            o = DrawdownShield(max_dd_frac)
+            _DDSHIELD["obj"] = o
+        return o.update(equity)
+    except Exception:
+        return {"mult": 0.5, "state": "UNKNOWN"}
+
+
+class VolTarget:
+    """Volatility targeting: scale size so realized vol hits the target.
+
+    target_vol (ann.) vs realized_vol -> mult = target/realized, bounded.
+    Quiet markets get size; stormy markets get humility. Uses log-returns
+    over a rolling window; warmup returns 1.0 (no opinion yet).
+    """
+
+    def __init__(self, target_ann=0.25, window=60, lo=0.25, hi=2.0):
+        self.target = target_ann
+        self.window = window
+        self.lo = lo
+        self.hi = hi
+        self.rets = []
+
+    def add_bar(self, px, prev_px, bars_per_year=525600 // 15):
+        try:
+            import math as _m
+            if prev_px and prev_px > 0 and px > 0:
+                self.rets.append(_m.log(px / prev_px))
+                del self.rets[:-self.window]
+            if len(self.rets) < 20:
+                return {"mult": 1.0, "state": "WARMUP"}
+            mu = sum(self.rets) / len(self.rets)
+            var = sum((x - mu) ** 2 for x in self.rets) / len(self.rets)
+            real = (var * bars_per_year) ** 0.5
+            if real < 1e-9:
+                return {"mult": 1.0, "state": "FLATLINE"}
+            mult = qclip(self.target / real, self.lo, self.hi)
+            return {"mult": round(mult, 3), "state": "OK",
+                    "realized_ann": round(real, 3), "target_ann": self.target}
+        except Exception:
+            return {"mult": 1.0, "state": "UNKNOWN"}
+
+
+_VOLT = {}
+
+
+def quantum_voltarget(symbol, px, prev_px, target_ann=0.25):
+    try:
+        k = str(symbol).upper()
+        o = _VOLT.get(k)
+        if o is None:
+            o = VolTarget(target_ann)
+            _VOLT[k] = o
+        return o.add_bar(px, prev_px)
+    except Exception:
+        return {"mult": 1.0, "state": "UNKNOWN"}
+
+
+class PortfolioHeat:
+    """Correlation-adjusted heat: 3 same-direction USD bets = 1 big bet.
+
+    heat = sqrt(w' C w) over open positions (w = risk-R signed, C = corr).
+    New trades pass only if marginal heat stays under the cap.
+    """
+
+    def __init__(self, cap_r=4.0):
+        self.cap = cap_r
+        self.positions = []  # [{symbol, risk_r, side, corr_group}]
+
+    def set_positions(self, positions):
+        try:
+            self.positions = [dict(p) for p in positions or []]
+        except Exception:
+            pass
+
+    @staticmethod
+    def _corr(a, b):
+        try:
+            if a == b:
+                return 1.0
+            # Same-quote families correlate; metals vs USD-flags inversely
+            qa = str(a)[-3:]
+            qb = str(b)[-3:]
+            if qa == qb:
+                return 0.7
+            if "XAU" in (str(a) + str(b)) and "USD" in (str(a) + str(b)):
+                return -0.4
+            return 0.2
+        except Exception:
+            return 0.2
+
+    def heat(self, extra=None):
+        try:
+            poss = list(self.positions) + ([dict(extra)] if extra else [])
+            if not poss:
+                return 0.0
+            h2 = 0.0
+            for i, p in enumerate(poss):
+                for j, q in enumerate(poss):
+                    c = self._corr(p.get("symbol"), q.get("symbol")) if i != j else 1.0
+                    h2 += (p.get("risk_r", 0) * p.get("side", 1) *
+                           q.get("risk_r", 0) * q.get("side", 1) * c)
+            return max(0.0, h2) ** 0.5
+        except Exception:
+            return 0.0
+
+    def check(self, new_trade):
+        try:
+            before = self.heat()
+            after = self.heat(new_trade)
+            if after <= self.cap:
+                return {"pass": True, "heat": round(after, 2), "cap": self.cap}
+            # Partial allowance: shrink the new trade to fit the cap
+            room = max(0.0, self.cap - before)
+            need = float(new_trade.get("risk_r", 1) or 1)
+            frac = qclip(room / need, 0, 1)
+            return {"pass": frac > 0.25, "heat": round(after, 2), "cap": self.cap,
+                    "shrink_to": round(frac, 2),
+                    "reason": "heat_cap" if frac <= 0.25 else "heat_shrunk"}
+        except Exception:
+            return {"pass": True, "heat": 0.0}
+
+
+_HEAT = {"obj": None}
+
+
+def quantum_heat(positions=None, new_trade=None, cap_r=4.0):
+    try:
+        o = _HEAT.get("obj")
+        if o is None:
+            o = PortfolioHeat(cap_r)
+            _HEAT["obj"] = o
+        if positions is not None:
+            o.set_positions(positions)
+        if new_trade is None:
+            return {"heat": round(o.heat(), 2), "cap": o.cap}
+        return o.check(new_trade)
+    except Exception:
+        return {"pass": True, "heat": 0.0}
+
+
+class StreakManager:
+    """Streak-aware sizing: press hot hands lightly, starve cold ones.
+
+    Win streak: mult up to 1.3x (capped — no euphoria gambling).
+    Loss streak: mult down to 0.3x, full stop at 6 straight (tilt lockout).
+    Resets on opposite outcome. Per strategy AND global.
+    """
+
+    def __init__(self):
+        self.streaks = {}  # key -> signed count
+
+    def record(self, key, won):
+        try:
+            k = str(key)
+            s = self.streaks.get(k, 0)
+            s = s + 1 if won else (s - 1 if s < 0 else -1)
+            if won and s < 0:
+                s = 1
+            if not won and s > 0:
+                s = -1
+            self.streaks[k] = s
+            return s
+        except Exception:
+            return 0
+
+    def mult(self, key):
+        try:
+            s = self.streaks.get(str(key), 0)
+            if s >= 4:
+                return 1.3
+            if s == 3:
+                return 1.15
+            if s <= -6:
+                return 0.0  # tilt lockout
+            if s <= -4:
+                return 0.3
+            if s == -3:
+                return 0.5
+            if s == -2:
+                return 0.7
+            return 1.0
+        except Exception:
+            return 1.0
+
+    def locked_out(self, key):
+        try:
+            return self.streaks.get(str(key), 0) <= -6
+        except Exception:
+            return False
+
+
+_STREAK = {"obj": None}
+
+
+def quantum_streak(key, won=None):
+    try:
+        o = _STREAK.get("obj")
+        if o is None:
+            o = StreakManager()
+            _STREAK["obj"] = o
+        if won is not None:
+            o.record(key, won)
+        return {"mult": o.mult(key), "locked": o.locked_out(key),
+                "streak": o.streaks.get(str(key), 0)}
+    except Exception:
+        return {"mult": 1.0, "locked": False}
+
+
+class GapGuard:
+    """Weekend/event gap limiter: flatten or shrink into known gaps.
+
+    Checks time-to-weekend and the news calendar; returns a position cap
+    fraction. Fridays + high-impact events within 2h => reduce to 25%.
+    """
+
+    @staticmethod
+    def cap(now_ts=None, symbol="XAUUSD"):
+        try:
+            import time as _t
+            import datetime as _dt
+            now = now_ts or _t.time()
+            dt = _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc)
+            # Weekend: after Friday 20:00 UTC or before Sunday 22:00 UTC
+            wd, hr = dt.weekday(), dt.hour
+            if wd == 4 and hr >= 20:
+                return {"frac": 0.25, "reason": "weekend_approach"}
+            if wd == 5:
+                return {"frac": 0.0, "reason": "weekend"}
+            if wd == 6 and hr < 22:
+                return {"frac": 0.25, "reason": "weekend_open_thin"}
+            # Event proximity
+            try:
+                ns = quantum_news_state(now, symbol)
+                mins = abs(float(ns.get("mins_to_event", 9999)))
+                if mins < 120 and ns.get("impact") == "high":
+                    return {"frac": 0.25, "reason": f"pre_{ns.get('event_class')}"}
+                if mins < 30:
+                    return {"frac": 0.5, "reason": "pre_event"}
+            except Exception:
+                pass
+            return {"frac": 1.0, "reason": "clear"}
+        except Exception:
+            return {"frac": 1.0, "reason": "fallback"}
+
+
+class RiskStack:
+    """Compose EVERY governor into one final size. The last word on lots."""
+
+    @staticmethod
+    def size(base_lots, ctx=None):
+        """ctx: {equity, symbol, px, prev_px, strategy, positions, new_risk_r,
+        max_dd_frac, target_ann}. Returns {lots, mult, factors, veto}."""
+        ctx = dict(ctx or {})
+        factors = {}
+        veto = None
+        try:
+            mult = 1.0
+            # 1. Drawdown shield
+            if ctx.get("equity") is not None:
+                dd = quantum_ddshield(ctx["equity"], ctx.get("max_dd_frac", 0.15))
+                factors["ddshield"] = dd["mult"]
+                mult *= dd["mult"]
+                if dd["mult"] <= 0:
+                    veto = "dd_floor"
+            # 2. Vol target
+            if ctx.get("px") and ctx.get("prev_px"):
+                vt = quantum_voltarget(ctx.get("symbol", "XAUUSD"), ctx["px"],
+                                       ctx["prev_px"], ctx.get("target_ann", 0.25))
+                factors["voltarget"] = vt["mult"]
+                mult *= vt["mult"]
+            # 3. Drift
+            try:
+                df_ = quantum_drift_factor()
+                factors["drift"] = df_
+                mult *= df_
+            except Exception:
+                pass
+            # 4. Streak (strategy + global)
+            try:
+                st = quantum_streak(ctx.get("strategy", "global"))
+                sg = quantum_streak("__global__")
+                factors["streak"] = st["mult"]
+                factors["streak_global"] = sg["mult"]
+                mult *= st["mult"] * sg["mult"]
+                if st["locked"] or sg["locked"]:
+                    veto = "tilt_lockout"
+            except Exception:
+                pass
+            # 5. Heat
+            try:
+                h = quantum_heat(ctx.get("positions"),
+                                 {"symbol": ctx.get("symbol", "XAUUSD"),
+                                  "risk_r": ctx.get("new_risk_r", 1.0),
+                                  "side": ctx.get("side", 1)})
+                if not h.get("pass", True):
+                    veto = h.get("reason", "heat_cap")
+                factors["heat"] = h.get("shrink_to", 1.0)
+                mult *= h.get("shrink_to", 1.0)
+            except Exception:
+                pass
+            # 6. Gap guard
+            try:
+                g = GapGuard.cap(symbol=ctx.get("symbol", "XAUUSD"))
+                factors["gap"] = g["frac"]
+                mult *= g["frac"]
+                if g["frac"] <= 0:
+                    veto = g["reason"]
+            except Exception:
+                pass
+            # 7. Meta verdict
+            try:
+                mv = quantum_meta_verdict()
+                if mv.get("verdict") == "HALT_NEW_RISK":
+                    veto = "meta_halt"
+                elif mv.get("verdict") == "DEGRADED":
+                    factors["meta"] = 0.5
+                    mult *= 0.5
+                else:
+                    factors["meta"] = 1.0
+            except Exception:
+                pass
+            lots = float(base_lots) * mult
+            try:
+                lots = quantum_spec(ctx.get("symbol", "XAUUSD")).round_vol(lots)
+            except Exception:
+                lots = round(lots, 2)
+            return {"lots": lots, "mult": round(mult, 4), "factors": factors,
+                    "veto": veto}
+        except Exception as e:
+            return {"lots": base_lots, "mult": 1.0, "factors": factors,
+                    "veto": veto, "error": str(e)}
+
+
+def quantum_risk_stack(base_lots, ctx=None):
+    try:
+        return RiskStack.size(base_lots, ctx)
+    except Exception as e:
+        return {"lots": base_lots, "mult": 1.0, "factors": {}, "veto": None}
+
+
+SECTION_J2_OK = True
