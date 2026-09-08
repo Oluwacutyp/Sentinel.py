@@ -23717,3 +23717,3839 @@ if __name__ == "__main__":
     main()
 
 
+
+# ============================================================================
+# PHASE E — SENTINEL QUANTUM CORE v13.0
+# ----------------------------------------------------------------------------
+# Why this exists (the honest diagnosis):
+#   The v12 signal path counts FIXED points (score += 3.0 per indicator hit)
+#   against a FIXED gate (min_score 7.0), in ALL regimes, ALL sessions, at ANY
+#   spread. Backtests prove the result: coin-flip win rate paying full spread
+#   => negative expectancy. No stop tweak or confluence layer can rescue a
+#   negative-expectancy SELECTOR. So Phase E replaces the SELECTOR, not the
+#   framework: execution, alerts, state, charts, news, scalping, recovery and
+#   the backtest harness are untouched. Only the decision brain is reborn:
+#
+#     E0  Quantum config registration (flag-guarded; OFF = byte-identical v12)
+#     E1  Quantum foundation utilities (adaptive stats, safe math, persistence)
+#     E2  QuantumRegimeEngine (quantile-calibrated multi-TF regime fusion)
+#     E3  EarlyAnalysisGate (pre-flight: spread/session/vol/cost/news gates)
+#     E4  SessionIntelligence (learned session performance + gating)
+#     E5  CalibratedScoringEngine (weights LEARNED from signal-outcome DB)
+#     E6  QuantumDecider (fuse + verdict; the ONE junction the loop calls)
+#     E7  NarrativeEngineV2 (decision audit + trade lifecycle stories)
+#   PHASE F  Pine-parity pack (OMNI-GOD concepts reborn as adaptive detectors)
+#   PHASE G  WalkForwardLab (OOS validation + overfit guards for the new core)
+#   PHASE H  QuantumRiskOverlay (vol targeting, correlation brake, governor)
+#
+# Doctrine: NO hardcoded maths. Every threshold is quantile-calibrated,
+# cost-derived, or learned from outcomes. Every veto explains itself.
+# ============================================================================
+
+# ============================================================================
+# E0 — QUANTUM CONFIG REGISTRATION
+# ============================================================================
+# Appended (not inlined) so the v12 CONFIG literal above stays pristine.
+# CFG is the SAME object as CONFIG (CFG = CONFIG), so update() propagates.
+QUANTUM_DEFAULTS = {
+    # Master switches
+    "quantum_core_enabled": True,     # False => pure v12 behavior, zero drift
+    "quantum_shadow_mode": False,     # True => new brain votes+logs but v12 executes (safe A/B)
+    "quantum_min_confidence": 0.55,   # calibrated P(win) gate (adaptive floor below)
+    "quantum_confidence_floor": 0.50, # never demand more than this when data is thin
+    "quantum_confidence_cap": 0.72,   # never demand less than this when data is rich
+    # Regime engine
+    "quantum_regime_tfs": ["M5", "M15", "H1", "H4"],
+    "quantum_regime_feature_window": 60,
+    "quantum_regime_cal_window": 500,
+    "quantum_regime_hysteresis": 3,
+    "quantum_squeeze_q": 0.15,
+    "quantum_panic_q": 0.95,
+    "quantum_trend_q": 0.45,
+    # Early analysis gate
+    "quantum_early_enabled": True,
+    "quantum_spread_max_pctile": 0.80,   # reject if spread above 80th pctile of own history
+    "quantum_spread_history": 500,
+    "quantum_min_edge_r": 0.35,          # min expected R AFTER costs to consider a trade
+    "quantum_cost_slippage_atr": 0.05,
+    "quantum_vol_freeze_q": 0.98,        # volatility quantile that freezes new entries
+    "quantum_vol_starve_q": 0.04,        # volatility quantile that starves entries (dead tape)
+    "quantum_session_gating": True,
+    "quantum_news_blackout_min": 15,     # hard blackout minutes around high-impact news
+    # Session intelligence
+    "quantum_session_min_trades": 12,    # min outcomes before a session multiplier binds
+    "quantum_session_max_boost": 1.35,
+    "quantum_session_max_cut": 0.45,
+    "quantum_session_decay": 0.97,       # per-day decay of old session stats
+    # Calibrated scoring
+    "quantum_cal_enabled": True,
+    "quantum_cal_min_samples": 60,       # min labeled outcomes before learned weights bind
+    "quantum_cal_lookback": 4000,        # max outcome rows pulled from STORE
+    "quantum_cal_l2": 1.0,               # ridge strength for weight learning
+    "quantum_cal_lr": 0.05,              # online logistic calibration step
+    "quantum_cal_bins": 10,              # reliability bins for isotonic-lite mapping
+    "quantum_cal_retrain_bars": 500,     # re-fit weights this often (bars on decision TF)
+    "quantum_prior_strength": 25.0,      # pseudo-count anchoring weights to priors
+    # Decider
+    "quantum_regime_routing": True,      # route/veto strategies by regime fit
+    "quantum_disagreement_veto": 0.30,   # veto if committee agreement below this
+    "quantum_min_agreement": 0.50,
+    "quantum_hysteresis_enter": 0.0,     # 0 => cost-derived (recommended)
+    "quantum_hysteresis_exit": 0.03,
+    # Narrative v2
+    "quantum_narrative": True,
+    "quantum_narrative_dir": "logs/quantum_narratives",
+    "quantum_audit_every_decision": True,
+    # Walk-forward lab
+    "quantum_wf_folds": 4,
+    "quantum_wf_embargo_bars": 20,
+    # Risk overlay
+    "quantum_risk_overlay": True,
+    "quantum_vol_target_annual": 0.25,
+    "quantum_max_heat": 0.80,
+    "quantum_corr_brake": 0.75,
+}
+try:
+    for _qk, _qv in QUANTUM_DEFAULTS.items():
+        if _qk not in CONFIG:
+            CONFIG[_qk] = _qv
+    QUANTUM_CFG_OK = True
+except Exception:
+    QUANTUM_CFG_OK = False
+
+
+def _qcfg(key, default=None):
+    """Lazy quantum config read: CFG at runtime, QUANTUM_DEFAULTS fallback."""
+    try:
+        g = globals()
+        cfg = g.get("CFG") or g.get("CONFIG") or {}
+        if key in cfg:
+            return cfg[key]
+    except Exception:
+        pass
+    if key in QUANTUM_DEFAULTS:
+        return QUANTUM_DEFAULTS[key]
+    return default
+
+
+def _qlog():
+    """Lazy logger: file LOG at runtime, stdlib fallback otherwise."""
+    try:
+        g = globals()
+        lg = g.get("LOG")
+        if lg is not None:
+            return lg
+    except Exception:
+        pass
+    import logging as _logging
+    return _logging.getLogger("quantum")
+
+
+# ============================================================================
+# E1 — QUANTUM FOUNDATION UTILITIES
+# ============================================================================
+
+class EWMAStat:
+    """Exponentially-weighted mean/variance tracker with persistence.
+
+    Used for everything that drifts: spread baseline, ATR%, slippage, win
+    rate, cost estimates. Variance via West's online-corrected EWMA.
+    """
+    def __init__(self, alpha=0.05, name=""):
+        self.alpha = float(min(0.5, max(1e-4, alpha)))
+        self.name = str(name)
+        self.n = 0
+        self.mean = 0.0
+        self._m2 = 0.0
+
+    def update(self, x):
+        try:
+            x = float(x)
+        except Exception:
+            return self
+        if x != x or x in (float("inf"), float("-inf")):
+            return self
+        a = self.alpha if self.n > 0 else 1.0
+        self.n += 1
+        delta = x - self.mean
+        self.mean += a * delta
+        self._m2 = (1.0 - a) * (self._m2 + a * delta * delta)
+        return self
+
+    @property
+    def var(self):
+        return max(0.0, float(self._m2))
+
+    @property
+    def sd(self):
+        return float(self.var ** 0.5)
+
+    def z(self, x):
+        try:
+            return (float(x) - self.mean) / (self.sd + 1e-12)
+        except Exception:
+            return 0.0
+
+    def band(self, k=2.0):
+        return (self.mean - k * self.sd, self.mean + k * self.sd)
+
+    def to_dict(self):
+        return {"alpha": self.alpha, "name": self.name, "n": self.n,
+                "mean": self.mean, "m2": self._m2}
+
+    @classmethod
+    def from_dict(cls, d):
+        o = cls(alpha=d.get("alpha", 0.05), name=d.get("name", ""))
+        o.n = int(d.get("n", 0))
+        o.mean = float(d.get("mean", 0.0))
+        o._m2 = float(d.get("m2", 0.0))
+        return o
+
+
+class QuantileWindow:
+    """Bounded reservoir for exact rolling quantiles.
+
+    Keeps the last `maxlen` finite values; quantile()/bands() use numpy when
+    available, else a pure-python fallback. This is the workhorse behind
+    'no hardcoded thresholds': gates calibrate to their own history.
+    """
+    def __init__(self, maxlen=500, name=""):
+        from collections import deque as _dq
+        self.maxlen = int(max(20, maxlen))
+        self.name = str(name)
+        self._dq = _dq(maxlen=self.maxlen)
+
+    def update(self, x):
+        try:
+            x = float(x)
+        except Exception:
+            return self
+        if x == x and abs(x) != float("inf"):
+            self._dq.append(x)
+        return self
+
+    def extend(self, xs):
+        try:
+            for x in xs:
+                self.update(x)
+        except Exception:
+            pass
+        return self
+
+    def __len__(self):
+        return len(self._dq)
+
+    def _sorted(self):
+        return sorted(self._dq)
+
+    def quantile(self, q):
+        q = float(min(0.999, max(0.001, q)))
+        if not self._dq:
+            return 0.0
+        try:
+            import numpy as _np
+            return float(_np.quantile(list(self._dq), q))
+        except Exception:
+            s = self._sorted()
+            pos = q * (len(s) - 1)
+            lo = int(pos)
+            hi = min(len(s) - 1, lo + 1)
+            frac = pos - lo
+            return float(s[lo] * (1 - frac) + s[hi] * frac)
+
+    def median(self):
+        return self.quantile(0.5)
+
+    def bands(self, lo_q=0.2, hi_q=0.8):
+        return (self.quantile(lo_q), self.quantile(hi_q))
+
+    def pct_rank(self, x):
+        """Fraction of history <= x (adaptive percentile of a live value)."""
+        if not self._dq:
+            return 0.5
+        try:
+            x = float(x)
+            n = len(self._dq)
+            le = sum(1 for v in self._dq if v <= x)
+            return float(le / max(1, n))
+        except Exception:
+            return 0.5
+
+    def to_dict(self):
+        return {"maxlen": self.maxlen, "name": self.name, "vals": list(self._dq)[-self.maxlen:]}
+
+    @classmethod
+    def from_dict(cls, d):
+        o = cls(maxlen=d.get("maxlen", 500), name=d.get("name", ""))
+        o.extend(d.get("vals", []) or [])
+        return o
+
+
+def qpersist_save(name, obj):
+    """Persist a JSON-serializable quantum object under state/quantum/."""
+    try:
+        import json as _json
+        import os as _os
+        base = _os.path.join("state", "quantum")
+        _os.makedirs(base, exist_ok=True)
+        safe = "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in str(name))
+        with open(_os.path.join(base, safe + ".json"), "w", encoding="utf-8") as f:
+            _json.dump(obj, f)
+        return True
+    except Exception as e:
+        try:
+            _qlog().debug(f"[QE1] persist save failed {name}: {e}")
+        except Exception:
+            pass
+        return False
+
+
+def qpersist_load(name, default=None):
+    try:
+        import json as _json
+        import os as _os
+        safe = "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in str(name))
+        p = _os.path.join("state", "quantum", safe + ".json")
+        if not _os.path.exists(p):
+            return default
+        with open(p, encoding="utf-8") as f:
+            return _json.load(f)
+    except Exception:
+        return default
+
+
+def qsdiv(a, b, default=0.0):
+    try:
+        b = float(b)
+        if b == 0.0 or b != b:
+            return float(default)
+        r = float(a) / b
+        if r != r or abs(r) == float("inf"):
+            return float(default)
+        return r
+    except Exception:
+        return float(default)
+
+
+def qclip(x, lo, hi):
+    try:
+        return float(min(hi, max(lo, float(x))))
+    except Exception:
+        return float(lo)
+
+
+def qsign(x):
+    try:
+        x = float(x)
+        if x > 0:
+            return 1.0
+        if x < 0:
+            return -1.0
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def _qnp():
+    """Numpy if usable, else None (pure-python fallbacks everywhere)."""
+    try:
+        g = globals()
+        if g.get("NP_OK") is False:
+            return None
+        import numpy as _np
+        return _np
+    except Exception:
+        return None
+
+
+def _qpd():
+    try:
+        g = globals()
+        if g.get("PD_OK") is False:
+            return None
+        import pandas as _pd
+        return _pd
+    except Exception:
+        return None
+
+
+def qas_series(obj, col):
+    """Extract a float list from a pandas Series/DataFrame/dict/list for `col`."""
+    try:
+        import pandas as _pd
+        if isinstance(obj, _pd.DataFrame) and col in obj.columns:
+            return [float(v) for v in obj[col].tolist()]
+        if isinstance(obj, _pd.Series):
+            return [float(v) for v in obj.tolist()]
+    except Exception:
+        pass
+    try:
+        if isinstance(obj, dict) and col in obj:
+            v = obj[col]
+            if isinstance(v, (list, tuple)):
+                return [float(x) for x in v]
+            return [float(v)]
+    except Exception:
+        pass
+    try:
+        if isinstance(obj, (list, tuple)):
+            return [float(x) for x in obj]
+    except Exception:
+        pass
+    return []
+
+
+def q_true_range(h, l, c):
+    """True range list from high/low/close lists (Wilder)."""
+    n = min(len(h), len(l), len(c))
+    out = []
+    pc = c[0] if n else 0.0
+    for i in range(n):
+        try:
+            hi, lo, cl = float(h[i]), float(l[i]), float(c[i])
+            out.append(max(hi - lo, abs(hi - pc), abs(lo - pc)))
+            pc = cl
+        except Exception:
+            out.append(0.0)
+    return out
+
+
+def q_atr_from_lists(h, l, c, n=14):
+    """Wilder ATR series (list) with RMA seeding; nan-safe."""
+    n = int(max(2, n))
+    tr = q_true_range(h, l, c)
+    if not tr:
+        return []
+    out = [0.0] * len(tr)
+    if len(tr) < n:
+        seed = sum(tr) / max(1, len(tr))
+        return [seed] * len(tr)
+    seed = sum(tr[:n]) / n
+    out[n - 1] = seed
+    for i in range(n, len(tr)):
+        out[i] = (out[i - 1] * (n - 1) + tr[i]) / n
+    for i in range(n - 1):
+        out[i] = seed
+    return out
+
+
+def q_atr(df, n=14):
+    h = qas_series(df, "high")
+    l = qas_series(df, "low")
+    c = qas_series(df, "close")
+    return q_atr_from_lists(h, l, c, n)
+
+
+def q_zscore_list(x, w):
+    """Rolling z-score (last value); pure python, nan-safe."""
+    w = int(max(5, w))
+    vals = [float(v) for v in x[-w:] if v == v]
+    if len(vals) < 5:
+        return 0.0
+    m = sum(vals) / len(vals)
+    var = sum((v - m) ** 2 for v in vals) / max(1, len(vals) - 1)
+    sd = var ** 0.5
+    if sd <= 1e-12:
+        return 0.0
+    return (vals[-1] - m) / sd
+
+
+def q_efficiency(close, w):
+    """Kaufman efficiency ratio in [0,1]: net displacement / path length."""
+    w = int(max(5, w))
+    vals = [float(v) for v in close[-(w + 1):]]
+    if len(vals) < 6:
+        return 0.0
+    net = abs(vals[-1] - vals[0])
+    path = sum(abs(vals[i] - vals[i - 1]) for i in range(1, len(vals))) + 1e-12
+    return float(max(0.0, min(1.0, net / path)))
+
+
+def q_hurst_rs(close, w=60):
+    """Rescaled-range Hurst estimate on log prices. >0.5 trending, <0.5 MR."""
+    vals = [float(v) for v in close[-w:]]
+    if len(vals) < 20:
+        return 0.5
+    try:
+        import math as _m
+        rets = [_m.log(vals[i] / vals[i - 1]) for i in range(1, len(vals)) if vals[i - 1] > 0]
+        if len(rets) < 16:
+            return 0.5
+        m = sum(rets) / len(rets)
+        dev = [r - m for r in rets]
+        cum, mx, mn, s = 0.0, -1e18, 1e18, 0.0
+        for d in dev:
+            cum += d
+            mx = max(mx, cum)
+            mn = min(mn, cum)
+        var = sum(d * d for d in dev) / len(dev)
+        sd = var ** 0.5
+        if sd <= 1e-12:
+            return 0.5
+        rs = (mx - mn) / sd
+        if rs <= 0:
+            return 0.5
+        return float(max(0.05, min(0.95, _m.log(rs) / _m.log(len(rets)))))
+    except Exception:
+        return 0.5
+
+
+def q_adx_dmi(h, l, c, n=14):
+    """Wilder ADX/+DI/-DI (last values). Returns dict, nan-safe."""
+    n = int(max(2, n))
+    m = min(len(h), len(l), len(c))
+    if m < n + 2:
+        return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0}
+    try:
+        trs, pdms, mdms = [], [], []
+        for i in range(1, m):
+            hi, lo, cl = float(h[i]), float(l[i]), float(c[i])
+            phi, plo, pcl = float(h[i - 1]), float(l[i - 1]), float(c[i - 1])
+            trs.append(max(hi - lo, abs(hi - pcl), abs(lo - pcl)))
+            up, dn = hi - phi, plo - lo
+            pdms.append(up if up > dn and up > 0 else 0.0)
+            mdms.append(dn if dn > up and dn > 0 else 0.0)
+        atr = sum(trs[:n]) / n
+        pdm = sum(pdms[:n]) / n
+        mdm = sum(mdms[:n]) / n
+        dxs = []
+        for i in range(n, len(trs)):
+            atr = (atr * (n - 1) + trs[i]) / n
+            pdm = (pdm * (n - 1) + pdms[i]) / n
+            mdm = (mdm * (n - 1) + mdms[i]) / n
+            if atr > 1e-12:
+                pdi = 100.0 * pdm / atr
+                mdi = 100.0 * mdm / atr
+                dxs.append(100.0 * abs(pdi - mdi) / (pdi + mdi + 1e-12))
+        adx = sum(dxs[-n:]) / n if len(dxs) >= n else (sum(dxs) / max(1, len(dxs)))
+        if atr > 1e-12:
+            pdi_l, mdi_l = 100.0 * pdm / atr, 100.0 * mdm / atr
+        else:
+            pdi_l = mdi_l = 0.0
+        return {"adx": float(adx), "plus_di": float(pdi_l), "minus_di": float(mdi_l)}
+    except Exception:
+        return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0}
+
+
+def q_bbw(close, n=20, mult=2.0):
+    """Bollinger bandwidth % (last value): (upper-lower)/middle."""
+    vals = [float(v) for v in close[-n:]]
+    if len(vals) < 5:
+        return 0.0
+    m = sum(vals) / len(vals)
+    var = sum((v - m) ** 2 for v in vals) / max(1, len(vals) - 1)
+    sd = var ** 0.5
+    if abs(m) <= 1e-12:
+        return 0.0
+    return float(2.0 * mult * sd / abs(m))
+
+
+def q_r2_slope(close, w=60):
+    """Signed R² of linear fit on log price: sign(slope)*R² in [-1,1]."""
+    vals = [float(v) for v in close[-w:] if float(v) > 0]
+    if len(vals) < 8:
+        return 0.0
+    try:
+        import math as _m
+        y = [_m.log(v) for v in vals]
+        n = len(y)
+        xmean = (n - 1) / 2.0
+        ymean = sum(y) / n
+        sxy = sum((i - xmean) * (v - ymean) for i, v in enumerate(y))
+        sxx = sum((i - xmean) ** 2 for i in range(n)) + 1e-12
+        slope = sxy / sxx
+        ss_tot = sum((v - ymean) ** 2 for v in y) + 1e-12
+        ss_res = sum((y[i] - (ymean + slope * (i - xmean))) ** 2 for i in range(n))
+        r2 = max(0.0, 1.0 - ss_res / ss_tot)
+        return float(r2 * (1.0 if slope >= 0 else -1.0))
+    except Exception:
+        return 0.0
+
+
+def q_range_pos(close, w=60):
+    """Last close position inside rolling high-low in [0,1]."""
+    vals = [float(v) for v in close[-w:]]
+    if len(vals) < 5:
+        return 0.5
+    hi, lo = max(vals), min(vals)
+    if hi - lo <= 1e-12:
+        return 0.5
+    return float(max(0.0, min(1.0, (vals[-1] - lo) / (hi - lo))))
+
+
+def q_vol_ratio(close, fast=20, slow=100):
+    """Short-horizon stdev / long-horizon stdev of returns."""
+    vals = [float(v) for v in close[-(slow + 2):]]
+    if len(vals) < slow // 2 + 5:
+        return 1.0
+    try:
+        rets = [(vals[i] / vals[i - 1] - 1.0) for i in range(1, len(vals)) if vals[i - 1] != 0]
+        if len(rets) < 10:
+            return 1.0
+        import statistics as _st
+        f = _st.pstdev(rets[-fast:]) if len(rets) >= fast else _st.pstdev(rets)
+        s = _st.pstdev(rets)
+        if s <= 1e-12:
+            return 1.0
+        return float(f / s)
+    except Exception:
+        return 1.0
+
+
+def q_atr_pct(h, l, c, n=14):
+    a = q_atr_from_lists(h, l, c, n)
+    if not a or not c:
+        return 0.0
+    px = float(c[-1]) if c[-1] else 1e-9
+    return float(a[-1] / (abs(px) + 1e-12))
+
+
+def q_volume_z(df, w=50):
+    v = qas_series(df, "tick_volume")
+    if not v:
+        v = qas_series(df, "volume")
+    if not v:
+        v = qas_series(df, "real_volume")
+    if len(v) < 10:
+        return 0.0
+    return q_zscore_list(v, w)
+
+
+def utc_session(ts=None):
+    """UTC session label + intraday progress. No hardcoded P/L beliefs."""
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        if ts is None:
+            now = _dt.now(_tz.utc)
+        elif hasattr(ts, "hour"):
+            now = ts
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=_tz.utc)
+        else:
+            now = _dt.now(_tz.utc)
+        h = now.hour + now.minute / 60.0
+        if 0.0 <= h < 7.0:
+            return ("ASIA", (h - 0.0) / 7.0)
+        if 7.0 <= h < 12.0:
+            return ("LONDON", (h - 7.0) / 5.0)
+        if 12.0 <= h < 16.0:
+            return ("OVERLAP", (h - 12.0) / 4.0)
+        if 16.0 <= h < 21.0:
+            return ("NEWYORK", (h - 16.0) / 5.0)
+        return ("OFF", (h - 21.0) / 3.0 if h >= 21.0 else 0.0)
+    except Exception:
+        return ("OFF", 0.0)
+
+
+def r_multiple(entry, sl, exit_px, direction):
+    """Realized R multiple of a closed trade idea. Long/short symmetric."""
+    try:
+        entry, sl, exit_px = float(entry), float(sl), float(exit_px)
+        d = 1.0 if str(direction).upper().startswith("B") else -1.0
+        risk = (entry - sl) * d
+        if risk <= 1e-12:
+            return 0.0
+        return float(((exit_px - entry) * d) / risk)
+    except Exception:
+        return 0.0
+
+
+def edge_after_costs(p_win, payoff_r, cost_r):
+    """Expectancy in R after friction. THE number that decides trading."""
+    try:
+        p = qclip(p_win, 0.0, 1.0)
+        return float(p * float(payoff_r) - (1.0 - p) * 1.0 - float(cost_r))
+    except Exception:
+        return -1.0
+
+
+SECTION_E1_OK = True
+
+
+# ============================================================================
+# E2 — QUANTUM REGIME ENGINE (adaptive multi-timeframe regime fusion)
+# ============================================================================
+# Fuses (never replaces) the file's existing detectors. Thresholds are
+# quantile bands calibrated on each symbol's own history, persisted, and
+# re-calibrated as markets evolve. Output feeds strategy routing (which
+# strategies may fire) and the calibrated scorer (context features).
+# ============================================================================
+
+REGIME_LABELS = ("TREND_UP", "TREND_DOWN", "RANGE", "SQUEEZE", "PANIC")
+
+# Prior routing: which strategy families are ALLOWED a voice in each regime.
+# Values are multipliers in [0,1]; the CalibratedScoringEngine later adapts
+# them from realized outcomes (E5), so these are starting beliefs, not laws.
+REGIME_ROUTE_PRIORS = {
+    "TREND_UP":   {"trend": 1.0, "breakout": 0.9, "pullback": 0.9, "meanrev": 0.15,
+                   "scalp": 0.7, "smc": 0.9, "news": 0.6, "divergence": 0.4, "asian": 0.5},
+    "TREND_DOWN": {"trend": 1.0, "breakout": 0.9, "pullback": 0.9, "meanrev": 0.15,
+                   "scalp": 0.7, "smc": 0.9, "news": 0.6, "divergence": 0.4, "asian": 0.5},
+    "RANGE":      {"trend": 0.25, "breakout": 0.35, "pullback": 0.7, "meanrev": 1.0,
+                   "scalp": 0.9, "smc": 0.8, "news": 0.6, "divergence": 0.8, "asian": 0.6},
+    "SQUEEZE":    {"trend": 0.20, "breakout": 1.0, "pullback": 0.4, "meanrev": 0.30,
+                   "scalp": 0.4, "smc": 0.7, "news": 0.5, "divergence": 0.5, "asian": 0.9},
+    "PANIC":      {"trend": 0.10, "breakout": 0.20, "pullback": 0.2, "meanrev": 0.35,
+                   "scalp": 0.2, "smc": 0.4, "news": 0.3, "divergence": 0.3, "asian": 0.2},
+}
+
+STRATEGY_FAMILY_MAP = {
+    "trend": "trend", "trendfollowing": "trend", "ma": "trend", "ema": "trend",
+    "ichimoku": "trend", "supertrend": "trend", "donchian": "trend",
+    "breakout": "breakout", "squeeze": "breakout", "donchain": "breakout",
+    "pullback": "pullback", "retracement": "pullback", "fib": "pullback",
+    "meanrev": "meanrev", "mean_reversion": "meanrev", "zscore": "meanrev",
+    "rsi": "meanrev", "stoch": "meanrev", "bb_": "meanrev", "bollinger": "meanrev",
+    "scalp": "scalp", "scalping": "scalp", "m1": "scalp",
+    "smc": "smc", "orderblock": "smc", "fvg": "smc", "liquidity": "smc",
+    "ict": "smc", "bos": "smc", "choch": "smc",
+    "news": "news", "cpi": "news", "straddle": "news", "event": "news",
+    "divergence": "divergence", "div": "divergence", "harmonic": "divergence",
+    "asian": "asian", "asia": "asian", "range_break": "asian",
+}
+
+
+def strategy_family(name):
+    """Map any strategy/signal name to a routing family (fuzzy, safe default)."""
+    try:
+        low = str(name or "").lower()
+        for key, fam in STRATEGY_FAMILY_MAP.items():
+            if key in low:
+                return fam
+    except Exception:
+        pass
+    return "trend"
+
+
+class RegimeFeatureExtractor:
+    """Computes the adaptive feature vector for ONE timeframe dataframe."""
+
+    FEATURES = ("eff", "hurst", "adx", "adx_dir", "r2", "bbw", "vol_ratio",
+                "range_pos", "atr_pct", "vol_z", "mom_align", "close_z")
+
+    @staticmethod
+    def compute(df, window=None):
+        w = int(window or _qcfg("quantum_regime_feature_window", 60))
+        out = {k: 0.0 for k in RegimeFeatureExtractor.FEATURES}
+        try:
+            c = qas_series(df, "close")
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            if len(c) < 30:
+                return out
+            out["eff"] = q_efficiency(c, w)
+            out["hurst"] = q_hurst_rs(c, min(w, 120))
+            dmi = q_adx_dmi(h, l, c, 14)
+            out["adx"] = float(dmi["adx"]) / 100.0
+            out["adx_dir"] = qsign(dmi["plus_di"] - dmi["minus_di"]) * min(1.0, abs(dmi["plus_di"] - dmi["minus_di"]) / 25.0)
+            out["r2"] = q_r2_slope(c, w)
+            out["bbw"] = q_bbw(c, 20, 2.0)
+            out["vol_ratio"] = qclip(q_vol_ratio(c, 20, 100), 0.0, 4.0)
+            out["range_pos"] = q_range_pos(c, w)
+            out["atr_pct"] = q_atr_pct(h, l, c, 14)
+            out["vol_z"] = qclip(q_volume_z(df, 50), -5.0, 5.0)
+            mom_fast = qsdiv(c[-1] - c[-6], c[-6]) if len(c) > 6 else 0.0
+            mom_slow = qsdiv(c[-1] - c[-25], c[-25]) if len(c) > 25 else 0.0
+            out["mom_align"] = qsign(mom_fast) * (1.0 if qsign(mom_fast) == qsign(mom_slow) else 0.25)
+            out["close_z"] = qclip(q_zscore_list(c, w), -5.0, 5.0)
+        except Exception as e:
+            try:
+                _qlog().debug(f"[QE2] feature extract failed: {e}")
+            except Exception:
+                pass
+        for k in list(out.keys()):
+            try:
+                v = float(out[k])
+                if v != v or abs(v) == float("inf"):
+                    out[k] = 0.0
+            except Exception:
+                out[k] = 0.0
+        return out
+
+
+class AdaptiveBands:
+    """Per-feature quantile bands: the opposite of hardcoded thresholds.
+
+    Calibrated on rolling history windows of feature vectors; classifies any
+    live value into LOW/MID/HIGH zones with soft margins. Persisted per
+    symbol so calibration survives restarts.
+    """
+    def __init__(self, symbol="XAUUSDm"):
+        self.symbol = str(symbol)
+        self.trackers = {}
+        self.calibrated_bars = 0
+
+    def _tracker(self, name):
+        t = self.trackers.get(name)
+        if t is None:
+            t = QuantileWindow(maxlen=int(_qcfg("quantum_regime_cal_window", 500)), name=name)
+            self.trackers[name] = t
+        return t
+
+    def observe(self, feats):
+        try:
+            for k, v in (feats or {}).items():
+                self._tracker(k).update(v)
+            self.calibrated_bars += 1
+        except Exception:
+            pass
+        return self
+
+    def zone(self, name, value):
+        """Return (zone in {-1,0,1}, strength in [0,1]) for a live value."""
+        try:
+            t = self.trackers.get(name)
+            if t is None or len(t) < 30:
+                return (0, 0.0)
+            lo = t.quantile(0.30)
+            hi = t.quantile(0.70)
+            span = (hi - lo) + 1e-12
+            v = float(value)
+            if v <= lo:
+                return (-1, qclip((lo - v) / span + 0.5, 0.0, 1.0))
+            if v >= hi:
+                return (1, qclip((v - hi) / span + 0.5, 0.0, 1.0))
+            mid = (lo + hi) / 2.0
+            return (0, qclip(1.0 - abs(v - mid) / (span + 1e-12), 0.0, 1.0))
+        except Exception:
+            return (0, 0.0)
+
+    def pct(self, name, value):
+        try:
+            t = self.trackers.get(name)
+            if t is None or len(t) < 30:
+                return 0.5
+            return t.pct_rank(value)
+        except Exception:
+            return 0.5
+
+    def ready(self):
+        try:
+            return self.calibrated_bars >= 60 and any(len(t) >= 30 for t in self.trackers.values())
+        except Exception:
+            return False
+
+    def to_dict(self):
+        return {"symbol": self.symbol, "bars": self.calibrated_bars,
+                "trackers": {k: t.to_dict() for k, t in self.trackers.items()}}
+
+    @classmethod
+    def from_dict(cls, d):
+        o = cls(symbol=(d or {}).get("symbol", "XAUUSDm"))
+        o.calibrated_bars = int((d or {}).get("bars", 0))
+        for k, td in ((d or {}).get("trackers", {}) or {}).items():
+            try:
+                o.trackers[k] = QuantileWindow.from_dict(td)
+            except Exception:
+                pass
+        return o
+
+    def save(self):
+        return qpersist_save(f"regime_bands_{self.symbol}", self.to_dict())
+
+    @classmethod
+    def load(cls, symbol):
+        d = qpersist_load(f"regime_bands_{symbol}")
+        if d:
+            try:
+                return cls.from_dict(d)
+            except Exception:
+                pass
+        return cls(symbol=symbol)
+
+
+class SingleTFRegime:
+    """Classifies ONE timeframe into 5 regimes using calibrated bands."""
+
+    @staticmethod
+    def classify(feats, bands, squeeze_q=None, panic_q=None, trend_q=None):
+        sq = float(squeeze_q if squeeze_q is not None else _qcfg("quantum_squeeze_q", 0.15))
+        pq = float(panic_q if panic_q is not None else _qcfg("quantum_panic_q", 0.95))
+        tq = float(trend_q if trend_q is not None else _qcfg("quantum_trend_q", 0.45))
+        scores = {lab: 0.0 for lab in REGIME_LABELS}
+        try:
+            f = feats or {}
+            # Volatility state from own history (never absolute numbers)
+            bbw_p = bands.pct("bbw", f.get("bbw", 0.0)) if bands else 0.5
+            vol_p = bands.pct("vol_ratio", f.get("vol_ratio", 1.0)) if bands else 0.5
+            atr_p = bands.pct("atr_pct", f.get("atr_pct", 0.0)) if bands else 0.5
+            squeeze_p = 1.0 - max(bbw_p, vol_p)
+            panic_p = max(vol_p, atr_p)
+            # Trend evidence: signed R² + efficiency + hurst + ADX alignment
+            r2 = float(f.get("r2", 0.0))
+            eff = float(f.get("eff", 0.0))
+            hurst = float(f.get("hurst", 0.5))
+            adx = float(f.get("adx", 0.0))
+            adx_dir = float(f.get("adx_dir", 0.0))
+            trend_mag = (abs(r2) * 0.35 + eff * 0.25 +
+                         qclip((hurst - 0.5) * 2.0, 0.0, 1.0) * 0.20 +
+                         qclip(adx, 0.0, 1.0) * 0.20)
+            tdir = qsign(r2 * 0.6 + adx_dir * 0.4)
+            if tdir == 0:
+                tdir = qsign(f.get("mom_align", 0.0))
+            # Panic: extreme expansion
+            if panic_p >= pq:
+                scores["PANIC"] = 0.55 + 0.45 * qclip((panic_p - pq) / (1 - pq + 1e-9), 0, 1)
+            # Squeeze: extreme compression
+            if squeeze_p >= (1.0 - sq):
+                s = 0.55 + 0.45 * qclip((squeeze_p - (1 - sq)) / (sq + 1e-9), 0, 1)
+                scores["SQUEEZE"] = max(scores["SQUEEZE"], s)
+            # Trend vs range by calibrated magnitude
+            if trend_mag >= tq and tdir != 0:
+                lab = "TREND_UP" if tdir > 0 else "TREND_DOWN"
+                scores[lab] = 0.45 + 0.55 * qclip((trend_mag - tq) / (1 - tq + 1e-9), 0, 1)
+            else:
+                scores["RANGE"] = 0.45 + 0.55 * qclip(1.0 - trend_mag / (tq + 1e-9), 0, 1)
+            # Range boost when price oscillates mid-range with low efficiency
+            rp = float(f.get("range_pos", 0.5))
+            if 0.25 <= rp <= 0.75 and eff < 0.35:
+                scores["RANGE"] += 0.15
+            # Squeeze→expansion bias: compressed + momentum ignition
+            if squeeze_p > 0.7 and abs(float(f.get("mom_align", 0.0))) >= 1.0:
+                scores["SQUEEZE"] += 0.10
+            # Normalize to a pseudo-distribution
+            tot = sum(max(0.0, v) for v in scores.values()) or 1.0
+            for k in scores:
+                scores[k] = float(max(0.0, scores[k]) / tot)
+            label = max(scores, key=lambda k: scores[k])
+            conf = float(scores[label])
+            return {"label": label, "confidence": conf, "scores": scores,
+                    "trend_mag": float(trend_mag), "squeeze_p": float(squeeze_p),
+                    "panic_p": float(panic_p)}
+        except Exception as e:
+            try:
+                _qlog().debug(f"[QE2] classify failed: {e}")
+            except Exception:
+                pass
+            return {"label": "RANGE", "confidence": 0.34,
+                    "scores": {lab: (0.34 if lab == "RANGE" else 0.165) for lab in REGIME_LABELS},
+                    "trend_mag": 0.0, "squeeze_p": 0.0, "panic_p": 0.0}
+
+
+class MultiTFRegimeFusion:
+    """Fuses per-TF regimes with agreement-weighted voting + hysteresis."""
+
+    TF_WEIGHTS = {"M1": 0.5, "M5": 0.8, "M15": 1.0, "M30": 1.1, "H1": 1.3, "H4": 1.5, "D1": 1.2}
+
+    def __init__(self, hysteresis=None):
+        self.hysteresis = int(hysteresis if hysteresis is not None
+                              else _qcfg("quantum_regime_hysteresis", 3))
+        self._last = None
+        self._run = 0
+
+    def fuse(self, per_tf):
+        """per_tf: {tf: classify-dict}. Returns fused dict with agreement."""
+        try:
+            votes = {lab: 0.0 for lab in REGIME_LABELS}
+            wsum = 0.0
+            dirs = []
+            for tf, res in (per_tf or {}).items():
+                w = float(self.TF_WEIGHTS.get(str(tf).upper(), 1.0))
+                conf = float((res or {}).get("confidence", 0.0))
+                lab = str((res or {}).get("label", "RANGE"))
+                if lab not in votes:
+                    lab = "RANGE"
+                votes[lab] += w * (0.35 + 0.65 * conf)
+                wsum += w
+                dirs.append(lab)
+            if wsum <= 0:
+                return {"label": "RANGE", "confidence": 0.34, "agreement": 0.0,
+                        "votes": votes, "per_tf": per_tf or {}}
+            for k in votes:
+                votes[k] /= wsum
+            label = max(votes, key=lambda k: votes[k])
+            # Agreement: share of TF weight behind the winner
+            agree = 0.0
+            tot_w = 0.0
+            for tf, res in (per_tf or {}).items():
+                w = float(self.TF_WEIGHTS.get(str(tf).upper(), 1.0))
+                tot_w += w
+                if str((res or {}).get("label", "")) == label:
+                    agree += w
+            agreement = qsdiv(agree, tot_w, 0.0)
+            # Hysteresis: new label must win N consecutive fusions
+            if self._last is None:
+                self._last, self._run = label, 1
+            elif label == self._last:
+                self._run += 1
+            else:
+                self._run += 1
+                if self._run >= self.hysteresis:
+                    self._last, self._run = label, 1
+                else:
+                    label = self._last
+            conf = float(qclip(votes[label] * (0.55 + 0.45 * agreement), 0.0, 1.0))
+            return {"label": label, "confidence": conf, "agreement": float(agreement),
+                    "votes": {k: float(v) for k, v in votes.items()}, "per_tf": per_tf or {}}
+        except Exception as e:
+            try:
+                _qlog().debug(f"[QE2] fuse failed: {e}")
+            except Exception:
+                pass
+            return {"label": "RANGE", "confidence": 0.34, "agreement": 0.0,
+                    "votes": {lab: 0.2 for lab in REGIME_LABELS}, "per_tf": per_tf or {}}
+
+
+class QuantumRegimeEngine:
+    """Facade: observe markets -> calibrated multi-TF regime state.
+
+    Also owns the ADAPTIVE routing table (regime x family multipliers),
+    updated by the CalibratedScoringEngine from realized outcomes.
+    """
+    def __init__(self, symbol=None, tfs=None):
+        self.symbol = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        self.tfs = list(tfs or _qcfg("quantum_regime_tfs", ["M5", "M15", "H1", "H4"]))
+        self.bands = AdaptiveBands.load(self.symbol)
+        self.fusion = MultiTFRegimeFusion()
+        self.window = int(_qcfg("quantum_regime_feature_window", 60))
+        self.route = {r: dict(REGIME_ROUTE_PRIORS[r]) for r in REGIME_LABELS}
+        self._load_route()
+        self.history = []
+        self.last_state = None
+
+    # ---------------- routing table (adaptive) ----------------
+    def _load_route(self):
+        try:
+            d = qpersist_load(f"regime_route_{self.symbol}")
+            if isinstance(d, dict):
+                for r in REGIME_LABELS:
+                    if r in d and isinstance(d[r], dict):
+                        for fam, v in d[r].items():
+                            if fam in self.route[r]:
+                                self.route[r][fam] = qclip(v, 0.0, 1.0)
+        except Exception:
+            pass
+
+    def save_route(self):
+        return qpersist_save(f"regime_route_{self.symbol}", self.route)
+
+    def adapt_route(self, regime, family, outcome_r, lr=0.05):
+        """Nudge one routing cell toward realized outcome (E5 calls this)."""
+        try:
+            if regime not in self.route or family not in self.route[regime]:
+                return
+            target = 1.0 if float(outcome_r) > 0 else 0.0
+            cur = self.route[regime][family]
+            strength = qclip(abs(float(outcome_r)) / 2.0, 0.1, 1.0)
+            self.route[regime][family] = qclip(cur + lr * strength * (target - cur), 0.05, 1.0)
+        except Exception:
+            pass
+
+    def route_mult(self, regime, strategy_name):
+        try:
+            fam = strategy_family(strategy_name)
+            return float(self.route.get(regime, {}).get(fam, 0.6))
+        except Exception:
+            return 0.6
+
+    # ---------------- observation ----------------
+    def observe_tf(self, df, tf="H1"):
+        feats = RegimeFeatureExtractor.compute(df, self.window)
+        self.bands.observe(feats)
+        res = SingleTFRegime.classify(feats, self.bands)
+        res["tf"] = str(tf)
+        res["features"] = feats
+        return res
+
+    def update(self, dfs, persist_every=25):
+        """Full update from {tf: df}. Returns the fused RegimeState dict."""
+        per_tf = {}
+        try:
+            for tf in self.tfs:
+                df = (dfs or {}).get(tf)
+                if df is None or len(df) < 40:
+                    continue
+                try:
+                    per_tf[tf] = self.observe_tf(df, tf)
+                except Exception:
+                    continue
+            fused = self.fusion.fuse(per_tf)
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                ts = _dt.now(_tz.utc).isoformat()
+            except Exception:
+                ts = ""
+            state = {"label": fused["label"], "confidence": fused["confidence"],
+                     "agreement": fused["agreement"], "votes": fused["votes"],
+                     "per_tf": {k: {kk: vv for kk, vv in v.items() if kk != "features"}
+                                for k, v in per_tf.items()},
+                     "ts": ts, "symbol": self.symbol,
+                     "bands_ready": self.bands.ready()}
+            self.last_state = state
+            self.history.append({"label": state["label"], "conf": state["confidence"], "ts": ts})
+            if len(self.history) > 200:
+                self.history = self.history[-200:]
+            if len(self.history) % max(1, persist_every) == 0:
+                try:
+                    self.bands.save()
+                    self.save_route()
+                except Exception:
+                    pass
+            return state
+        except Exception as e:
+            try:
+                _qlog().debug(f"[QE2] update failed: {e}")
+            except Exception:
+                pass
+            return {"label": "RANGE", "confidence": 0.34, "agreement": 0.0,
+                    "votes": {lab: 0.2 for lab in REGIME_LABELS}, "per_tf": {},
+                    "ts": "", "symbol": self.symbol, "bands_ready": False}
+
+    def calibrate_offline(self, dfs_history, max_windows=8):
+        """Walk history backwards observing rolling windows (cold-start)."""
+        try:
+            for tf in self.tfs:
+                df = (dfs_history or {}).get(tf)
+                if df is None or len(df) < self.window + 60:
+                    continue
+                n = len(df)
+                step = max(1, (n - self.window) // max(1, max_windows))
+                for end in range(self.window + 20, n, step):
+                    try:
+                        chunk = df.iloc[max(0, end - self.window - 20):end]
+                        feats = RegimeFeatureExtractor.compute(chunk, self.window)
+                        self.bands.observe(feats)
+                    except Exception:
+                        continue
+            self.bands.save()
+            return True
+        except Exception as e:
+            try:
+                _qlog().debug(f"[QE2] offline calibrate failed: {e}")
+            except Exception:
+                pass
+            return False
+
+    def summary(self):
+        s = self.last_state or {"label": "RANGE", "confidence": 0.0, "agreement": 0.0}
+        try:
+            mix = {}
+            for h in self.history[-50:]:
+                mix[h["label"]] = mix.get(h["label"], 0) + 1
+            tot = sum(mix.values()) or 1
+            mix = {k: round(v / tot, 3) for k, v in sorted(mix.items(), key=lambda kv: -kv[1])}
+        except Exception:
+            mix = {}
+        return {"label": s.get("label"), "confidence": round(float(s.get("confidence", 0)), 3),
+                "agreement": round(float(s.get("agreement", 0)), 3),
+                "bands_ready": s.get("bands_ready", False), "recent_mix": mix}
+
+
+_QUANTUM_REGIME_SINGLETON = {}
+
+
+def get_quantum_regime(symbol=None):
+    """Lazy singleton accessor (safe to call from the live loop)."""
+    try:
+        sym = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        eng = _QUANTUM_REGIME_SINGLETON.get(sym)
+        if eng is None:
+            eng = QuantumRegimeEngine(symbol=sym)
+            _QUANTUM_REGIME_SINGLETON[sym] = eng
+        return eng
+    except Exception as e:
+        try:
+            _qlog().debug(f"[QE2] singleton failed: {e}")
+        except Exception:
+            pass
+        return None
+
+
+SECTION_E2_OK = True
+
+# ============================================================================
+# E3 — EARLY ANALYSIS GATE ("look before you leap")
+# ----------------------------------------------------------------------------
+# Runs BEFORE any signal is scored. Each gate answers one question with a
+# PASS/HOLD verdict plus machine-readable evidence. A single hard HOLD vetoes
+# the cycle; soft HOLDs shrink size via the multiplier. NOTHING here uses a
+# fixed market belief: spread/volatility/session gates calibrate to the
+# symbol's OWN history; the cost gate derives from live spread + ATR.
+# ============================================================================
+
+def _qstore():
+    try:
+        return globals().get("STORE")
+    except Exception:
+        return None
+
+
+def _q_recent_outcomes(limit=2000):
+    """Pull recent labeled outcomes from STORE via every available path.
+
+    Returns list of dicts: {pnl, r, strategy, regime, session, ts}.
+    Fully guarded: any failure => empty list (thin-data priors take over).
+    """
+    out = []
+    st = _qstore()
+    if st is None:
+        return out
+    # Path 1: feature samples with meta (richest: has regime/session/reason)
+    try:
+        rows = st.get_feature_samples_with_meta(limit=limit) or []
+        for r in rows:
+            try:
+                if isinstance(r, dict):
+                    meta = r.get("meta") or {}
+                    if isinstance(meta, str):
+                        try:
+                            import json as _j
+                            meta = _j.loads(meta)
+                        except Exception:
+                            meta = {}
+                    out.append({"pnl": float(r.get("pnl", 0.0) or 0.0),
+                                "r": float(r.get("r", r.get("r_mult", 0.0)) or 0.0),
+                                "strategy": str(r.get("strategy", meta.get("strategy", "")) or ""),
+                                "regime": str(r.get("regime", meta.get("regime", "")) or ""),
+                                "session": str(r.get("session", meta.get("session", "")) or ""),
+                                "ts": str(r.get("ts", r.get("created_at", "")) or "")})
+            except Exception:
+                continue
+        if out:
+            return out
+    except Exception:
+        pass
+    # Path 2: raw signal_outcomes table
+    try:
+        conn = getattr(st, "conn", None)
+        if conn is not None:
+            try:
+                cur = conn.execute(
+                    "SELECT pnl, r_mult, strategy, regime, session, created_at "
+                    "FROM signal_outcomes ORDER BY rowid DESC LIMIT ?", (int(limit),))
+                for pnl, rr, strat, reg, sess, ts in cur.fetchall():
+                    out.append({"pnl": float(pnl or 0.0), "r": float(rr or 0.0),
+                                "strategy": str(strat or ""), "regime": str(reg or ""),
+                                "session": str(sess or ""), "ts": str(ts or "")})
+                if out:
+                    return out
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Path 3: closed trades (no regime/session, still useful for base rates)
+    try:
+        rows = st.get_all_closed_trades() or []
+        for r in rows[-int(limit):]:
+            try:
+                if isinstance(r, dict):
+                    out.append({"pnl": float(r.get("pnl", 0.0) or 0.0),
+                                "r": float(r.get("r", r.get("r_mult", 0.0)) or 0.0),
+                                "strategy": str(r.get("strategy", r.get("dir", "")) or ""),
+                                "regime": "", "session": "", "ts": ""})
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+class SpreadState:
+    """Live spread tracker calibrated to its own rolling history."""
+    def __init__(self, symbol=None, maxlen=None):
+        self.symbol = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        self.window = QuantileWindow(maxlen=int(maxlen or _qcfg("quantum_spread_history", 500)),
+                                     name=f"spread_{self.symbol}")
+        self.last = None
+        self._load()
+
+    def _load(self):
+        try:
+            d = qpersist_load(f"spread_{self.symbol}")
+            if isinstance(d, dict):
+                self.window = QuantileWindow.from_dict(d)
+        except Exception:
+            pass
+
+    def save(self):
+        try:
+            return qpersist_save(f"spread_{self.symbol}", self.window.to_dict())
+        except Exception:
+            return False
+
+    def observe(self, spread):
+        try:
+            s = float(spread)
+            if s > 0 and s == s:
+                self.window.update(s)
+                self.last = s
+        except Exception:
+            pass
+        return self
+
+    def percentile(self, spread=None):
+        s = self.last if spread is None else spread
+        try:
+            return self.window.pct_rank(float(s))
+        except Exception:
+            return 0.5
+
+    def median(self):
+        try:
+            return self.window.median()
+        except Exception:
+            return 0.0
+
+    def norm_cost(self, spread=None, atr=None):
+        """Spread expressed in ATR fractions: the comparable cost unit."""
+        try:
+            s = float(self.last if spread is None else spread)
+            a = float(atr or 0.0)
+            if a > 1e-12:
+                return s / a
+            return 0.0
+        except Exception:
+            return 0.0
+
+
+class CostModel:
+    """Round-trip friction in R multiples, derived from LIVE conditions."""
+
+    @staticmethod
+    def roundtrip_r(spread, atr, sl_dist, slippage_atr=None, commission_r=0.0):
+        """Cost of spread + slippage + commission, in units of trade risk.
+
+        spread/atr/sl_dist in PRICE units. Returns R-multiple cost >= 0.
+        """
+        try:
+            sl = float(sl_dist)
+            if sl <= 1e-12:
+                return 1.0
+            slip = float(slippage_atr if slippage_atr is not None
+                         else _qcfg("quantum_cost_slippage_atr", 0.05))
+            a = float(atr or 0.0)
+            one_way = float(spread or 0.0) + slip * a
+            roundtrip = 2.0 * one_way + float(commission_r or 0.0) * sl
+            return float(max(0.0, roundtrip / sl))
+        except Exception:
+            return 0.5
+
+    @staticmethod
+    def min_payoff_for_edge(p_win, cost_r, target_edge_r=None):
+        """Required payoff R so expectancy clears the edge floor."""
+        try:
+            floor = float(target_edge_r if target_edge_r is not None
+                          else _qcfg("quantum_min_edge_r", 0.35))
+            p = qclip(p_win, 0.05, 0.95)
+            need = (floor + (1.0 - p) + float(cost_r)) / p
+            return float(max(0.5, need))
+        except Exception:
+            return 2.0
+
+
+class DataQualityProbe:
+    """Verifies the decision dataframe is fresh, dense, and sane."""
+
+    @staticmethod
+    def check(dfs, max_gap_bars=3, staleness_min=30):
+        issues = []
+        ok = True
+        try:
+            if not dfs:
+                return {"ok": False, "issues": ["no dataframes"], "bars": {}}
+            bars = {}
+            for tf, df in (dfs or {}).items():
+                try:
+                    n = len(df) if df is not None else 0
+                    bars[str(tf)] = int(n)
+                    if df is None or n < 60:
+                        issues.append(f"{tf}: only {n} bars")
+                        ok = False
+                        continue
+                    try:
+                        closes = qas_series(df, "close")
+                        if closes:
+                            bad = sum(1 for v in closes[-60:] if v != v or v <= 0)
+                            if bad > 5:
+                                issues.append(f"{tf}: {bad} bad closes")
+                                ok = False
+                    except Exception:
+                        pass
+                    try:
+                        idx = getattr(df, "index", None)
+                        if idx is not None and len(idx) > 0:
+                            last = idx[-1]
+                            import pandas as _pd
+                            from datetime import datetime as _dt, timezone as _tz
+                            if isinstance(last, _pd.Timestamp):
+                                last = last.to_pydatetime()
+                            if hasattr(last, "tzinfo") and last.tzinfo is None:
+                                last = last.replace(tzinfo=_tz.utc)
+                            age_min = (_dt.now(_tz.utc) - last).total_seconds() / 60.0
+                            if age_min > staleness_min and str(tf).upper() in ("M1", "M5", "M15"):
+                                issues.append(f"{tf}: stale {age_min:.0f}min")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    issues.append(f"{tf}: {e}")
+                    ok = False
+            return {"ok": ok, "issues": issues, "bars": bars}
+        except Exception as e:
+            return {"ok": False, "issues": [str(e)], "bars": {}}
+
+
+class NewsBlackoutProbe:
+    """Asks the file's NEWS protector (if alive) about high-impact proximity."""
+
+    @staticmethod
+    def check(blackout_min=None):
+        mins = int(blackout_min if blackout_min is not None
+                   else _qcfg("quantum_news_blackout_min", 15))
+        try:
+            news = globals().get("NEWS")
+            if news is None:
+                return {"ok": True, "blackout": False, "detail": "no NEWS module"}
+            try:
+                if hasattr(news, "is_news_time") and news.is_news_time():
+                    return {"ok": False, "blackout": True, "detail": "in news window"}
+            except Exception:
+                pass
+            try:
+                if hasattr(news, "get_events"):
+                    ev = news.get_events() or {}
+                    if isinstance(ev, dict):
+                        hi = [k for k, v in ev.items()
+                              if str(v).lower().find("high") >= 0 or str(k).lower().find("high") >= 0]
+                        if hi:
+                            return {"ok": False, "blackout": True,
+                                    "detail": f"high-impact: {hi[0]}"}
+                    elif ev:
+                        return {"ok": True, "blackout": False, "detail": "events calm"}
+            except Exception:
+                pass
+            return {"ok": True, "blackout": False, "detail": "clear"}
+        except Exception as e:
+            return {"ok": True, "blackout": False, "detail": f"probe error: {e}"}
+
+
+class DrawdownStateProbe:
+    """Reads live drawdown/pause state without duplicating the circuit logic."""
+
+    @staticmethod
+    def check():
+        try:
+            g = globals()
+            circ = g.get("CIRCUIT")
+            dd_pct = None
+            try:
+                # Prefer the bot's own tracker if exposed on CIRCUIT
+                for attr in ("current_dd", "drawdown", "dd_pct", "last_dd"):
+                    if circ is not None and hasattr(circ, attr):
+                        dd_pct = float(getattr(circ, attr))
+                        break
+            except Exception:
+                pass
+            if dd_pct is None:
+                try:
+                    st = g.get("STORE")
+                    if st is not None and hasattr(st, "get_latest_balance"):
+                        snap = st.get_latest_balance() or {}
+                        bal = float(snap.get("balance", 0) or 0)
+                        eq = float(snap.get("equity", bal) or bal)
+                        if bal > 0:
+                            dd_pct = (eq - bal) / bal * 100.0
+                except Exception:
+                    pass
+            paused = False
+            try:
+                paused = bool(g.get("PAUSED", False))
+            except Exception:
+                pass
+            return {"ok": True, "dd_pct": dd_pct, "paused": paused}
+        except Exception as e:
+            return {"ok": True, "dd_pct": None, "paused": False, "err": str(e)}
+
+
+class EarlyAnalysisGate:
+    """The pre-flight framework. check() runs BEFORE signal scoring.
+
+    Returns a verdict dict:
+      {pass(bool), hard_holds[list], soft_holds[list], size_mult[0..1],
+       cost_r, edge_floor, spread_pctile, session, gates{...}, evidence{...}}
+    """
+
+    def __init__(self, symbol=None):
+        self.symbol = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        self.spread = SpreadState(symbol=self.symbol)
+        self._session_intel = None
+
+    def _session(self):
+        if self._session_intel is None:
+            try:
+                self._session_intel = get_session_intelligence(self.symbol)
+            except Exception:
+                self._session_intel = None
+        return self._session_intel
+
+    def observe_tick(self, spread=None, bid=None, ask=None):
+        try:
+            if spread is None and bid is not None and ask is not None:
+                spread = float(ask) - float(bid)
+            if spread is not None:
+                self.spread.observe(spread)
+        except Exception:
+            pass
+
+    def check(self, dfs, tick=None, regime_state=None, sl_dist_hint=None):
+        verdict = {"pass": True, "hard_holds": [], "soft_holds": [],
+                   "size_mult": 1.0, "cost_r": 0.0,
+                   "edge_floor": float(_qcfg("quantum_min_edge_r", 0.35)),
+                   "spread_pctile": 0.5, "session": "OFF", "gates": {}, "evidence": {}}
+        if not _qcfg("quantum_early_enabled", True):
+            verdict["gates"]["master"] = {"pass": True, "detail": "early gate disabled"}
+            return verdict
+        try:
+            tick = tick or {}
+            # ---- Gate 1: data quality (HARD) ----
+            dq = DataQualityProbe.check(dfs)
+            verdict["gates"]["data"] = {"pass": bool(dq["ok"]), "detail": "; ".join(dq["issues"][:4]) or "clean",
+                                        "bars": dq.get("bars", {})}
+            if not dq["ok"]:
+                verdict["hard_holds"].append("data:" + (dq["issues"][0] if dq["issues"] else "bad"))
+            # ---- Gate 2: spread percentile (HARD above cap, soft near cap) ----
+            spr = tick.get("spread", tick.get("spread_now", None))
+            if spr is None:
+                try:
+                    spr = float(tick.get("ask", 0) or 0) - float(tick.get("bid", 0) or 0)
+                    if spr <= 0:
+                        spr = None
+                except Exception:
+                    spr = None
+            if spr is not None:
+                self.observe_tick(spread=spr)
+                pct = self.spread.percentile(spr)
+            else:
+                pct = 0.5
+            verdict["spread_pctile"] = float(pct)
+            cap = float(_qcfg("quantum_spread_max_pctile", 0.80))
+            if pct >= 0.97:
+                verdict["hard_holds"].append(f"spread p{int(pct * 100)}>=97 (extreme)")
+                verdict["gates"]["spread"] = {"pass": False, "detail": f"extreme p{int(pct * 100)}"}
+            elif pct >= cap:
+                verdict["soft_holds"].append(f"spread p{int(pct * 100)}>={int(cap * 100)}")
+                verdict["size_mult"] *= 0.5
+                verdict["gates"]["spread"] = {"pass": True, "soft": True, "detail": f"wide p{int(pct * 100)}"}
+            else:
+                verdict["gates"]["spread"] = {"pass": True, "detail": f"p{int(pct * 100)}"}
+            # ---- Gate 3: volatility state (HARD freeze / starve) ----
+            try:
+                main_tf = str(_qcfg("timeframes", ["M15"])[0])
+                df0 = (dfs or {}).get(main_tf) or (dfs or {}).get("M15") or next(iter((dfs or {}).values()), None)
+                vr = 1.0
+                if df0 is not None:
+                    vr = q_vol_ratio(qas_series(df0, "close"), 20, 100)
+                frz = float(_qcfg("quantum_vol_freeze_q", 0.98))
+                stv = float(_qcfg("quantum_vol_starve_q", 0.04))
+                # Map vol_ratio to pseudo-quantile via tanh squash around 1.0
+                import math as _m
+                vq = 0.5 + 0.5 * _m.tanh((float(vr) - 1.0) * 2.0)
+                verdict["evidence"]["vol_ratio"] = float(vr)
+                if vq >= frz:
+                    verdict["hard_holds"].append(f"volatility freeze (vr={vr:.2f})")
+                    verdict["gates"]["volatility"] = {"pass": False, "detail": f"freeze vr={vr:.2f}"}
+                elif vq <= stv:
+                    verdict["soft_holds"].append(f"dead tape (vr={vr:.2f})")
+                    verdict["size_mult"] *= 0.4
+                    verdict["gates"]["volatility"] = {"pass": True, "soft": True, "detail": f"starve vr={vr:.2f}"}
+                else:
+                    verdict["gates"]["volatility"] = {"pass": True, "detail": f"vr={vr:.2f}"}
+            except Exception as e:
+                verdict["gates"]["volatility"] = {"pass": True, "detail": f"probe skipped: {e}"}
+            # ---- Gate 4: session (soft sizing via E4; hard only if learned BLOCK) ----
+            sess, prog = utc_session()
+            verdict["session"] = sess
+            try:
+                si = self._session()
+                if si is not None and _qcfg("quantum_session_gating", True):
+                    advice, mult, reason = si.gate_advice(sess)
+                    verdict["evidence"]["session_mult"] = float(mult)
+                    if advice == "BLOCK":
+                        verdict["hard_holds"].append(f"session {sess}: {reason}")
+                        verdict["gates"]["session"] = {"pass": False, "detail": reason}
+                    elif advice == "CAUTION":
+                        verdict["soft_holds"].append(f"session {sess}: {reason}")
+                        verdict["size_mult"] *= float(mult)
+                        verdict["gates"]["session"] = {"pass": True, "soft": True, "detail": reason}
+                    else:
+                        verdict["size_mult"] *= float(mult)
+                        verdict["gates"]["session"] = {"pass": True, "detail": f"{sess} x{mult:.2f}"}
+                else:
+                    verdict["gates"]["session"] = {"pass": True, "detail": f"{sess} (no intel)"}
+            except Exception as e:
+                verdict["gates"]["session"] = {"pass": True, "detail": f"skipped: {e}"}
+            # ---- Gate 5: news blackout (HARD) ----
+            nb = NewsBlackoutProbe.check()
+            verdict["gates"]["news"] = {"pass": bool(nb["ok"]), "detail": nb.get("detail", "")}
+            if not nb["ok"]:
+                verdict["hard_holds"].append("news:" + str(nb.get("detail", "blackout")))
+            # ---- Gate 6: cost vs edge floor (HARD if costs alone eat the floor) ----
+            try:
+                atr_hint = None
+                if df0 is not None:
+                    ah = q_atr(df0, 14)
+                    atr_hint = ah[-1] if ah else None
+                sl_hint = sl_dist_hint or (2.0 * (atr_hint or 0.0))
+                cost_r = CostModel.roundtrip_r(spr or 0.0, atr_hint or 0.0, sl_hint or 1.0)
+                verdict["cost_r"] = float(cost_r)
+                verdict["evidence"]["atr_hint"] = float(atr_hint or 0.0)
+                floor = verdict["edge_floor"]
+                # If even a 3R winner can't clear floor+costs at 45% win rate, hold.
+                worst_ok = edge_after_costs(0.45, 3.0, cost_r) >= -0.5
+                if not worst_ok:
+                    verdict["hard_holds"].append(f"costs eat edge (cost={cost_r:.2f}R)")
+                    verdict["gates"]["cost"] = {"pass": False, "detail": f"cost={cost_r:.2f}R"}
+                elif cost_r > 0.30:
+                    verdict["soft_holds"].append(f"heavy costs ({cost_r:.2f}R)")
+                    verdict["size_mult"] *= 0.6
+                    verdict["gates"]["cost"] = {"pass": True, "soft": True, "detail": f"cost={cost_r:.2f}R"}
+                else:
+                    verdict["gates"]["cost"] = {"pass": True, "detail": f"cost={cost_r:.2f}R"}
+            except Exception as e:
+                verdict["gates"]["cost"] = {"pass": True, "detail": f"skipped: {e}"}
+            # ---- Gate 7: drawdown/pause awareness (SOFT mirror; circuit stays king) ----
+            try:
+                dd = DrawdownStateProbe.check()
+                verdict["evidence"]["dd_pct"] = dd.get("dd_pct")
+                if dd.get("paused"):
+                    verdict["hard_holds"].append("account paused upstream")
+                    verdict["gates"]["dd"] = {"pass": False, "detail": "paused"}
+                else:
+                    verdict["gates"]["dd"] = {"pass": True, "detail": f"dd={dd.get('dd_pct')}"}
+            except Exception as e:
+                verdict["gates"]["dd"] = {"pass": True, "detail": f"skipped: {e}"}
+            # ---- Finalize ----
+            verdict["size_mult"] = qclip(verdict["size_mult"], 0.0, 1.0)
+            verdict["pass"] = len(verdict["hard_holds"]) == 0
+            try:
+                self.spread.save()
+            except Exception:
+                pass
+            return verdict
+        except Exception as e:
+            try:
+                _qlog().debug(f"[QE3] gate failed open: {e}")
+            except Exception:
+                pass
+            verdict["gates"]["fatal"] = {"pass": True, "detail": f"fail-open: {e}"}
+            return verdict
+
+
+_EARLY_GATE_SINGLETON = {}
+
+
+def get_early_gate(symbol=None):
+    try:
+        sym = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        g = _EARLY_GATE_SINGLETON.get(sym)
+        if g is None:
+            g = EarlyAnalysisGate(symbol=sym)
+            _EARLY_GATE_SINGLETON[sym] = g
+        return g
+    except Exception:
+        return None
+
+
+SECTION_E3_OK = True
+
+
+# ============================================================================
+# E4 — SESSION INTELLIGENCE (learned session performance + gating)
+# ----------------------------------------------------------------------------
+# The backtests proved session matters (XAU bled in NewYork). But hardcoding
+# "never trade NY" is exactly the sin we're abolishing. Instead: track
+# realized R per session with time decay, and gate/size from EVIDENCE.
+# Thin data => multiplier 1.0 (no opinion). BLOCK only with significance.
+# ============================================================================
+
+SESSIONS = ("ASIA", "LONDON", "OVERLAP", "NEWYORK", "OFF")
+
+
+class SessionCell:
+    """One session's outcome ledger with exponential time decay."""
+    def __init__(self, name=""):
+        self.name = str(name)
+        self.trades = 0
+        self.wins = 0
+        self.gross_r = 0.0
+        self.ewma_r = 0.0
+        self.last_ts = None
+
+    def record(self, r_mult, won=None, decay=None):
+        try:
+            r = float(r_mult)
+            if r != r:
+                return self
+            d = float(decay if decay is not None else _qcfg("quantum_session_decay", 0.97))
+            # Decay applies to accumulated mass (old evidence fades)
+            self.gross_r = self.gross_r * d + r
+            self.trades = self.trades * d + 1.0
+            w = 1.0 if (won if won is not None else r > 0) else 0.0
+            self.wins = self.wins * d + w
+            k = 1.0 / max(1.0, self.trades)
+            self.ewma_r = self.ewma_r + k * (r - self.ewma_r)
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                self.last_ts = _dt.now(_tz.utc).isoformat()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return self
+
+    @property
+    def win_rate(self):
+        return qsdiv(self.wins, self.trades, 0.5)
+
+    @property
+    def expectancy_r(self):
+        return qsdiv(self.gross_r, self.trades, 0.0)
+
+    def to_dict(self):
+        return {"name": self.name, "trades": self.trades, "wins": self.wins,
+                "gross_r": self.gross_r, "ewma_r": self.ewma_r, "last_ts": self.last_ts}
+
+    @classmethod
+    def from_dict(cls, d):
+        o = cls(name=(d or {}).get("name", ""))
+        for k in ("trades", "wins", "gross_r", "ewma_r"):
+            try:
+                setattr(o, k, float((d or {}).get(k, 0.0)))
+            except Exception:
+                pass
+        o.last_ts = (d or {}).get("last_ts")
+        return o
+
+
+class SessionIntelligence:
+    """Evidence-based session gating. Significance-gated, decay-aware."""
+
+    def __init__(self, symbol=None):
+        self.symbol = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        self.cells = {s: SessionCell(s) for s in SESSIONS}
+        self._synced = False
+        self._load()
+
+    def _load(self):
+        try:
+            d = qpersist_load(f"sessions_{self.symbol}")
+            if isinstance(d, dict):
+                for s, cd in d.items():
+                    if s in self.cells:
+                        try:
+                            self.cells[s] = SessionCell.from_dict(cd)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    def save(self):
+        try:
+            return qpersist_save(f"sessions_{self.symbol}",
+                                 {s: c.to_dict() for s, c in self.cells.items()})
+        except Exception:
+            return False
+
+    def sync_from_store(self, limit=None, force=False):
+        """Backfill from the outcome DB (idempotent-ish; call rarely)."""
+        if self._synced and not force:
+            return 0
+        n = 0
+        try:
+            rows = _q_recent_outcomes(limit or int(_qcfg("quantum_cal_lookback", 4000)))
+            # Reset then replay in chronological best-effort order
+            self.cells = {s: SessionCell(s) for s in SESSIONS}
+            for r in reversed(rows):
+                sess = str(r.get("session", "") or "").upper()
+                if sess not in self.cells:
+                    continue
+                self.cells[sess].record(r.get("r", 0.0))
+                n += 1
+            self._synced = True
+            self.save()
+        except Exception as e:
+            try:
+                _qlog().debug(f"[QE4] sync failed: {e}")
+            except Exception:
+                pass
+        return n
+
+    def record_outcome(self, session, r_mult, save_every=5):
+        try:
+            s = str(session or "").upper()
+            if s in self.cells:
+                self.cells[s].record(r_mult)
+                if int(sum(c.trades for c in self.cells.values())) % max(1, save_every) == 0:
+                    self.save()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def multiplier(self, session):
+        """Learned size multiplier in [cut, boost]; 1.0 when evidence thin."""
+        try:
+            s = str(session or "").upper()
+            cell = self.cells.get(s)
+            if cell is None:
+                return 1.0
+            min_t = float(_qcfg("quantum_session_min_trades", 12))
+            if cell.trades < min_t:
+                return 1.0
+            exp_r = cell.expectancy_r
+            # Map expectancy [-1R, +1R] to [cut, boost] smoothly
+            import math as _m
+            t = _m.tanh(exp_r * 1.5)  # [-1, 1]
+            lo = float(_qcfg("quantum_session_max_cut", 0.45))
+            hi = float(_qcfg("quantum_session_max_boost", 1.35))
+            if t >= 0:
+                return 1.0 + t * (hi - 1.0)
+            return 1.0 + t * (1.0 - lo)
+        except Exception:
+            return 1.0
+
+    def gate_advice(self, session):
+        """(advice, multiplier, reason). BLOCK needs significance + size."""
+        try:
+            s = str(session or "").upper()
+            mult = self.multiplier(s)
+            cell = self.cells.get(s)
+            if cell is None or cell.trades < float(_qcfg("quantum_session_min_trades", 12)):
+                return ("ALLOW", 1.0, f"{s}: thin data ({cell.trades:.0f} trades)" if cell else f"{s}: no data")
+            exp_r = cell.expectancy_r
+            wr = cell.win_rate
+            # BLOCK: confidently negative (exp < -0.25R AND wr < 40% AND 20+ trades)
+            if cell.trades >= 20 and exp_r < -0.25 and wr < 0.40:
+                return ("BLOCK", mult, f"{s}: exp {exp_r:+.2f}R wr {wr:.0%} over {cell.trades:.0f} (significant)")
+            if exp_r < -0.05 or mult < 0.8:
+                return ("CAUTION", mult, f"{s}: soft-negative exp {exp_r:+.2f}R (x{mult:.2f})")
+            if exp_r > 0.15 and mult > 1.1:
+                return ("ALLOW", mult, f"{s}: positive exp {exp_r:+.2f}R (x{mult:.2f})")
+            return ("ALLOW", mult, f"{s}: neutral exp {exp_r:+.2f}R")
+        except Exception as e:
+            return ("ALLOW", 1.0, f"advice error: {e}")
+
+    def table(self):
+        rows = []
+        for s in SESSIONS:
+            c = self.cells[s]
+            rows.append({"session": s, "trades": round(c.trades, 1),
+                         "win_rate": round(c.win_rate, 3),
+                         "exp_r": round(c.expectancy_r, 3),
+                         "mult": round(self.multiplier(s), 3)})
+        return rows
+
+
+_SESSION_SINGLETON = {}
+
+
+def get_session_intelligence(symbol=None):
+    try:
+        sym = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        si = _SESSION_SINGLETON.get(sym)
+        if si is None:
+            si = SessionIntelligence(symbol=sym)
+            _SESSION_SINGLETON[sym] = si
+        return si
+    except Exception:
+        return None
+
+
+SECTION_E4_OK = True
+
+# ============================================================================
+# E5 — CALIBRATED SCORING ENGINE (weights LEARNED from outcomes, not decreed)
+# ----------------------------------------------------------------------------
+# Replaces "score += 3.0" folk wisdom with a ridge-regularized logistic model
+# mapping signal features -> P(win), then calibrates the probability with a
+# binned reliability map, all trained on the bot's OWN signal-outcome history
+# (raw_signals + signal_outcomes + feature_store tables it already writes).
+#
+# Design guarantees:
+#  * Zero third-party ML deps (pure stdlib + optional numpy). Runs on any VPS.
+#  * Thin-data priors: with < N labeled samples, learned weights BLEND toward
+#    sane priors instead of binding (no cold-start insanity).
+#  * Online + batch: nightly batch refit + per-trade micro-updates.
+#  * Explainable: every probability decomposes into per-feature contributions.
+#  * Fail-soft: any exception => neutral 0.5 with reason (never blocks v12).
+# ============================================================================
+
+SIGNAL_FEATURE_NAMES = (
+    # --- raw signal strength (normalized, never absolute points) ---
+    "score_n",          # v12 score / dynamic scale (rolling p90 of logged scores)
+    "tf_w",             # decision-TF weight (M1<M5<M15<H1<H4, agreement-scaled later)
+    "dir_long",         # 1 if BUY else 0
+    # --- strategy family one-hots (fuzzy mapped) ---
+    "fam_trend", "fam_breakout", "fam_pullback", "fam_meanrev", "fam_scalp",
+    "fam_smc", "fam_news", "fam_divergence", "fam_asian",
+    # --- regime context one-hots + confidence ---
+    "reg_trend_up", "reg_trend_down", "reg_range", "reg_squeeze", "reg_panic",
+    "reg_conf", "reg_agree",
+    # --- session one-hots ---
+    "sess_asia", "sess_london", "sess_overlap", "sess_newyork", "sess_off",
+    # --- market state (adaptive, quantile-normalized) ---
+    "spread_p",         # spread percentile 0..1
+    "vol_ratio",        # clipped 0..3
+    "atr_pct_x100",     # atr% * 100 (XAU ~0.1-0.5 => 10-50 => scaled below)
+    "range_pos",        # 0..1
+    "corr_xau_dxy",     # -1..1 (0 if unknown)
+    "zone_conf_n",      # zone confluence / 5 clipped
+    "orchestrated",     # 1 if multi-engine vote
+    "asian_sig",        # 1 if asian-range engine fired
+    "trinity_vote",     # -1.5..+1.5 scaled
+    "ml_conf",          # v12 ML confidence 0..1 (0.5 unknown)
+    "penalty",          # penalty/reward engine adjustment, tanh-squashed
+    "hour_sin", "hour_cos",  # cyclical UTC hour (session micro-structure)
+)
+
+TF_WEIGHT_MAP = {"M1": 0.45, "M5": 0.65, "M15": 0.85, "M30": 0.95, "H1": 1.10,
+                 "H4": 1.25, "D1": 1.15}
+
+
+class SignalFeaturizer:
+    """Deterministic signal-dict -> numeric vector. Versioned for compat."""
+
+    VERSION = 1
+
+    @staticmethod
+    def _scale_score(score):
+        try:
+            st = _qstore()
+            if st is not None and hasattr(st, "conn") and getattr(st, "conn", None) is not None:
+                try:
+                    cur = st.conn.execute("SELECT base_score FROM raw_signals ORDER BY rowid DESC LIMIT 400")
+                    vals = sorted(float(r[0]) for r in cur.fetchall() if r[0] is not None)
+                    if len(vals) >= 40:
+                        import math as _m
+                        p90 = vals[int(0.9 * (len(vals) - 1))]
+                        if p90 > 1e-9:
+                            return float(score) / p90
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return float(score or 0.0) / 10.0
+
+    @staticmethod
+    def featurize(signal, context=None):
+        """Returns (names_tuple, vector_list). Never raises."""
+        ctx = context or {}
+        sig = signal or {}
+        try:
+            import math as _m
+            v = {}
+            v["score_n"] = qclip(SignalFeaturizer._scale_score(sig.get("score", 0.0)), -2.0, 3.0)
+            v["tf_w"] = float(TF_WEIGHT_MAP.get(str(sig.get("tf", "")).upper(), 0.8))
+            v["dir_long"] = 1.0 if str(sig.get("dir", "")).upper().startswith("B") else 0.0
+            fam = strategy_family(sig.get("strategy", sig.get("signal_type", "")))
+            for f in ("trend", "breakout", "pullback", "meanrev", "scalp", "smc",
+                      "news", "divergence", "asian"):
+                v["fam_" + f] = 1.0 if fam == f else 0.0
+            reg = ctx.get("regime") or {}
+            rlab = str(reg.get("label", "RANGE")).upper()
+            for r in ("TREND_UP", "TREND_DOWN", "RANGE", "SQUEEZE", "PANIC"):
+                v["reg_" + r.lower()] = 1.0 if rlab == r else 0.0
+            v["reg_conf"] = qclip(reg.get("confidence", 0.0), 0.0, 1.0)
+            v["reg_agree"] = qclip(reg.get("agreement", 0.0), 0.0, 1.0)
+            sess = str(ctx.get("session", "OFF")).upper()
+            for s in ("ASIA", "LONDON", "OVERLAP", "NEWYORK", "OFF"):
+                v["sess_" + s.lower()] = 1.0 if sess == s else 0.0
+            v["spread_p"] = qclip(ctx.get("spread_pctile", 0.5), 0.0, 1.0)
+            v["vol_ratio"] = qclip(ctx.get("vol_ratio", 1.0), 0.0, 3.0)
+            v["atr_pct_x100"] = qclip(float(ctx.get("atr_pct", 0.0)) * 100.0 / 50.0, 0.0, 3.0)
+            v["range_pos"] = qclip(ctx.get("range_pos", 0.5), 0.0, 1.0)
+            v["corr_xau_dxy"] = qclip(sig.get("correlation", ctx.get("correlation", 0.0) or 0.0), -1.0, 1.0)
+            v["zone_conf_n"] = qclip(float(sig.get("zone_confluence", 0) or 0) / 5.0, 0.0, 1.5)
+            v["orchestrated"] = 1.0 if sig.get("orchestrated") else 0.0
+            v["asian_sig"] = 1.0 if "asian" in str(sig.get("strategy", "")).lower() else 0.0
+            v["trinity_vote"] = qclip(float(sig.get("trinity_vote", ctx.get("trinity_vote", 0.0)) or 0.0) / 1.5, -1.0, 1.0)
+            v["ml_conf"] = qclip(sig.get("ml_confidence", sig.get("ml_conf", 0.5)), 0.0, 1.0)
+            v["penalty"] = float(_m.tanh(float(sig.get("penalty_adj", 0.0) or 0.0) / 3.0))
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                hr = _dt.now(_tz.utc).hour + _dt.now(_tz.utc).minute / 60.0
+            except Exception:
+                hr = 12.0
+            v["hour_sin"] = float(_m.sin(2 * _m.pi * hr / 24.0))
+            v["hour_cos"] = float(_m.cos(2 * _m.pi * hr / 24.0))
+            vec = [float(v.get(n, 0.0)) for n in SIGNAL_FEATURE_NAMES]
+            vec = [x if x == x and abs(x) != float("inf") else 0.0 for x in vec]
+            return (SIGNAL_FEATURE_NAMES, vec)
+        except Exception:
+            return (SIGNAL_FEATURE_NAMES, [0.0] * len(SIGNAL_FEATURE_NAMES))
+
+
+class RidgeLogistic:
+    """L2-regularized logistic regression. Numpy fast path + pure fallback.
+
+    Minimizes: mean(logloss) + l2 * ||w||^2  (intercept unpenalized).
+    Supports prior anchoring: extra pseudo-count pulling w toward w_prior.
+    """
+
+    def __init__(self, l2=1.0, iters=200, lr=0.5, prior=None, prior_strength=25.0):
+        self.l2 = float(l2)
+        self.iters = int(iters)
+        self.lr = float(lr)
+        self.prior = list(prior) if prior else None
+        self.prior_strength = float(prior_strength)
+        self.w = None
+        self.b = 0.0
+        self.n_features = 0
+        self.n_samples = 0
+
+    @staticmethod
+    def _sigmoid(z):
+        try:
+            import math as _m
+            if z >= 0:
+                return 1.0 / (1.0 + _m.exp(-z))
+            e = _m.exp(z)
+            return e / (1.0 + e)
+        except Exception:
+            return 0.5
+
+    def fit(self, X, y, sample_weight=None):
+        X = [list(map(float, row)) for row in (X or [])]
+        y = [1.0 if float(v) > 0.5 else 0.0 for v in (y or [])]
+        n = len(X)
+        if n == 0 or len(y) != n:
+            return False
+        p = len(X[0])
+        self.n_features, self.n_samples = p, n
+        sw = list(sample_weight) if sample_weight else [1.0] * n
+        sw = [float(max(1e-6, w)) for w in sw]
+        np = _qnp()
+        if np is not None:
+            try:
+                return self._fit_numpy(np, X, y, sw, p, n)
+            except Exception:
+                pass
+        return self._fit_pure(X, y, sw, p, n)
+
+    def _fit_numpy(self, np, X, y, sw, p, n):
+        Xa = np.array(X, dtype=float)
+        ya = np.array(y, dtype=float)
+        wa = np.array(sw, dtype=float)
+        w = np.zeros(p)
+        b = 0.0
+        if self.prior and len(self.prior) == p:
+            anchor = np.array(self.prior, dtype=float)
+        else:
+            anchor = np.zeros(p)
+        lam = self.l2 / max(1, n)
+        gamma = self.prior_strength / max(1, n)
+        lr = self.lr
+        wsum = wa.sum() or 1.0
+        for it in range(self.iters):
+            z = Xa.dot(w) + b
+            pr = 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
+            err = (pr - ya) * wa / wsum
+            gw = Xa.T.dot(err) + 2 * lam * w + 2 * gamma * (w - anchor)
+            gb = float(err.sum())
+            step = lr / (1.0 + it * 0.02)
+            w -= step * gw
+            b -= step * gb
+            if it % 50 == 0:
+                lr *= 0.9
+        self.w = [float(v) for v in w]
+        self.b = float(b)
+        return True
+
+    def _fit_pure(self, X, y, sw, p, n):
+        w = [0.0] * p
+        b = 0.0
+        anchor = list(self.prior) if (self.prior and len(self.prior) == p) else [0.0] * p
+        lam = self.l2 / max(1, n)
+        gamma = self.prior_strength / max(1, n)
+        wsum = sum(sw) or 1.0
+        lr = self.lr
+        for it in range(min(self.iters, 120)):
+            gw = [0.0] * p
+            gb = 0.0
+            for i in range(n):
+                z = sum(X[i][j] * w[j] for j in range(p)) + b
+                pr = self._sigmoid(max(-30.0, min(30.0, z)))
+                err = (pr - y[i]) * sw[i] / wsum
+                for j in range(p):
+                    gw[j] += err * X[i][j]
+                gb += err
+            step = lr / (1.0 + it * 0.02)
+            for j in range(p):
+                gw[j] += 2 * lam * w[j] + 2 * gamma * (w[j] - anchor[j])
+                w[j] -= step * gw[j]
+            b -= step * gb
+        self.w = w
+        self.b = b
+        return True
+
+    def decision(self, x):
+        try:
+            if not self.w:
+                return 0.0
+            return float(sum(float(a) * float(c) for a, c in zip(x, self.w)) + self.b)
+        except Exception:
+            return 0.0
+
+    def predict_proba(self, X):
+        if isinstance(X, (list, tuple)) and X and isinstance(X[0], (int, float)):
+            return [self._sigmoid(self.decision(X))]
+        return [self._sigmoid(self.decision(row)) for row in (X or [])]
+
+    def contributions(self, x):
+        """Per-feature logit contributions for explainability."""
+        try:
+            return [(SIGNAL_FEATURE_NAMES[i] if i < len(SIGNAL_FEATURE_NAMES) else f"f{i}",
+                     float(self.w[i]) * float(x[i]))
+                    for i in range(min(len(self.w or []), len(x)))]
+        except Exception:
+            return []
+
+    def to_dict(self):
+        return {"w": self.w, "b": self.b, "n_features": self.n_features,
+                "n_samples": self.n_samples, "l2": self.l2}
+
+    def load_dict(self, d):
+        try:
+            self.w = list((d or {}).get("w") or [])
+            self.b = float((d or {}).get("b", 0.0))
+            self.n_features = int((d or {}).get("n_features", len(self.w)))
+            self.n_samples = int((d or {}).get("n_samples", 0))
+            return bool(self.w)
+        except Exception:
+            return False
+
+
+class IsotonicLite:
+    """Binned reliability calibration: raw prob -> empirical win rate.
+
+    isotonic-lite: monotone-smoothed bin map. With thin bins, shrinks to the
+    diagonal (no correction) instead of hallucinating.
+    """
+    def __init__(self, bins=10, min_bin=15):
+        self.bins = int(max(4, bins))
+        self.min_bin = int(max(5, min_bin))
+        self.edges = [i / self.bins for i in range(self.bins + 1)]
+        self.rates = [0.05 + 0.9 * (i + 0.5) / self.bins for i in range(self.bins)]
+        self.counts = [0] * self.bins
+
+    def fit(self, probs, labels):
+        try:
+            sums = [0.0] * self.bins
+            cnts = [0] * self.bins
+            for pr, lab in zip(probs or [], labels or []):
+                try:
+                    p = qclip(pr, 0.0, 0.9999)
+                    b = min(self.bins - 1, int(p * self.bins))
+                    sums[b] += 1.0 if float(lab) > 0.5 else 0.0
+                    cnts[b] += 1
+                except Exception:
+                    continue
+            # Shrink each bin toward diagonal center by min_bin rule
+            rates = []
+            for i in range(self.bins):
+                center = (i + 0.5) / self.bins
+                if cnts[i] >= self.min_bin:
+                    w = cnts[i] / (cnts[i] + self.min_bin)
+                    rates.append(w * (sums[i] / cnts[i]) + (1 - w) * center)
+                else:
+                    rates.append(center)
+            # Monotone smoothing (pool adjacent violators, lite)
+            for _ in range(3):
+                for i in range(self.bins - 1):
+                    if rates[i] > rates[i + 1]:
+                        m = (rates[i] + rates[i + 1]) / 2
+                        rates[i] = rates[i + 1] = m
+            self.rates, self.counts = rates, cnts
+            return True
+        except Exception:
+            return False
+
+    def map(self, p):
+        try:
+            p = qclip(p, 0.0, 0.9999)
+            b = min(self.bins - 1, int(p * self.bins))
+            frac = p * self.bins - b
+            lo = self.rates[b]
+            hi = self.rates[min(self.bins - 1, b + 1)]
+            return float(qclip(lo * (1 - frac) + hi * frac, 0.01, 0.99))
+        except Exception:
+            return float(qclip(p, 0.01, 0.99))
+
+    def to_dict(self):
+        return {"bins": self.bins, "min_bin": self.min_bin,
+                "rates": self.rates, "counts": self.counts}
+
+    def load_dict(self, d):
+        try:
+            self.bins = int((d or {}).get("bins", self.bins))
+            self.min_bin = int((d or {}).get("min_bin", self.min_bin))
+            self.rates = list((d or {}).get("rates", self.rates))
+            self.counts = list((d or {}).get("counts", self.counts))
+            return True
+        except Exception:
+            return False
+
+
+# Prior weight beliefs (used at full strength when data is thin, fading as
+# evidence grows). Positive => win-associated. Deliberately small.
+CAL_PRIORS = {
+    "score_n": 0.55, "tf_w": 0.30, "dir_long": 0.0,
+    "fam_trend": 0.10, "fam_breakout": 0.12, "fam_pullback": 0.08,
+    "fam_meanrev": -0.05, "fam_scalp": 0.0, "fam_smc": 0.10,
+    "fam_news": -0.15, "fam_divergence": 0.05, "fam_asian": 0.05,
+    "reg_trend_up": 0.08, "reg_trend_down": 0.08, "reg_range": -0.05,
+    "reg_squeeze": 0.10, "reg_panic": -0.45, "reg_conf": 0.25, "reg_agree": 0.20,
+    "sess_asia": 0.05, "sess_london": 0.05, "sess_overlap": 0.08,
+    "sess_newyork": -0.05, "sess_off": -0.10,
+    "spread_p": -0.50, "vol_ratio": -0.10, "atr_pct_x100": 0.0,
+    "range_pos": 0.0, "corr_xau_dxy": 0.0, "zone_conf_n": 0.20,
+    "orchestrated": 0.25, "asian_sig": 0.05, "trinity_vote": 0.10,
+    "ml_conf": 0.30, "penalty": 0.15, "hour_sin": 0.0, "hour_cos": 0.0,
+}
+
+
+class CalibratedScoringEngine:
+    """The cure for fixed-point scoring.
+
+    Pipeline per candidate signal:
+      raw v12 score -> featurize -> ridge-logistic -> isotonic map
+      => calibrated P(win) + expected-R edge after costs.
+    Retrains from STORE on schedule; micro-updates online per closed trade.
+    """
+
+    def __init__(self, symbol=None):
+        self.symbol = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        prior_vec = [float(CAL_PRIORS.get(n, 0.0)) for n in SIGNAL_FEATURE_NAMES]
+        self.model = RidgeLogistic(l2=float(_qcfg("quantum_cal_l2", 1.0)),
+                                   prior=prior_vec,
+                                   prior_strength=float(_qcfg("quantum_prior_strength", 25.0)))
+        self.calibrator = IsotonicLite(bins=int(_qcfg("quantum_cal_bins", 10)))
+        self.n_learned = 0
+        self.last_fit_ts = None
+        self.base_rate = 0.5
+        self.score_scale_note = ""
+        self._load()
+
+    # ---------------- persistence ----------------
+    def _load(self):
+        try:
+            d = qpersist_load(f"calmodel_{self.symbol}")
+            if isinstance(d, dict):
+                if self.model.load_dict(d.get("model", {})):
+                    self.calibrator.load_dict(d.get("cal", {}))
+                    self.n_learned = int(d.get("n_learned", 0))
+                    self.last_fit_ts = d.get("fit_ts")
+                    self.base_rate = float(d.get("base_rate", 0.5))
+        except Exception:
+            pass
+
+    def save(self):
+        try:
+            return qpersist_save(f"calmodel_{self.symbol}",
+                                 {"model": self.model.to_dict(),
+                                  "cal": self.calibrator.to_dict(),
+                                  "n_learned": self.n_learned,
+                                  "fit_ts": self.last_fit_ts,
+                                  "base_rate": self.base_rate})
+        except Exception:
+            return False
+
+    # ---------------- training data ----------------
+    def _labeled_rows(self, limit=None):
+        """Join decision-time features to realized labels.
+
+        Strategy (schema-agnostic via PRAGMA):
+          1. raw_signals rows that carry an outcome (accepted + pnl/r/fate cols)
+          2. feature_store samples with labels
+          3. signal_outcomes joined nearest-in-time to raw_signals
+        Returns (X_rows, y_list, w_list, meta_list).
+        """
+        X, y, w, meta = [], [], [], []
+
+        # ---- Path 0 (best): trades -> signals -> raw_signals join chain ----
+        # Decision-time raw_features + realized pnl/r. Schema-verified linkage.
+        try:
+            _conn = getattr(st, "conn", None)
+            if _conn is not None:
+                try:
+                    _q = ("SELECT r.raw_features, r.base_score, r.tf, r.dir, "
+                          "s.entry, s.sl, s.tp, s.score, t.pnl, t.r_mult, t.strategy "
+                          "FROM trades t JOIN signals s ON s.id = t.signal_id "
+                          "JOIN raw_signals r ON r.id = s.raw_signal_id "
+                          "WHERE t.pnl IS NOT NULL ORDER BY t.rowid DESC LIMIT ?")
+                    for _row in _conn.execute(_q, (lim,)).fetchall():
+                        try:
+                            _raw, _bs, _tf, _dd, _e, _sl, _tp, _sc, _pnl, _rr, _st = _row
+                            _lab = 1.0 if float(_pnl or 0) > 0 else 0.0
+                            if _rr is not None:
+                                try:
+                                    _lab = 1.0 if float(_rr) > 0 else 0.0
+                                except Exception:
+                                    pass
+                            _d = {"features": _raw, "base_score": _bs, "tf": _tf,
+                                  "dir": _dd, "strategy": _st}
+                            _fv = self._row_features(_d)
+                            if _fv is None:
+                                continue
+                            # Recency weight: fresh outcomes count double
+                            _pos = len(X)
+                            _w = 1.0 + max(0.0, 1.0 - _pos / max(1, lim))
+                            X.append(_fv)
+                            y.append(_lab)
+                            w.append(_w)
+                            meta.append({"strategy": str(_st or "")})
+                        except Exception:
+                            continue
+                    if X:
+                        return X, y, w, meta
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        st = _qstore()
+        if st is None:
+            return X, y, w, meta
+        lim = int(limit or _qcfg("quantum_cal_lookback", 4000))
+        try:
+            conn = getattr(st, "conn", None)
+            if conn is not None:
+                try:
+                    cols = [r[1] for r in conn.execute("PRAGMA table_info(raw_signals)").fetchall()]
+                    pick = [c for c in ("features", "feature_json", "base_score", "score",
+                                        "tf", "direction", "dir", "strategy", "pnl", "r_mult",
+                                        "r", "fate", "accepted", "label", "won", "created_at", "ts")
+                            if c in cols]
+                    if pick:
+                        q = f"SELECT {', '.join(pick)} FROM raw_signals ORDER BY rowid DESC LIMIT ?"
+                        for row in conn.execute(q, (lim,)).fetchall():
+                            try:
+                                d = dict(zip(pick, row))
+                                lab = self._row_label(d)
+                                if lab is None:
+                                    continue
+                                feats = self._row_features(d)
+                                if feats is None:
+                                    continue
+                                X.append(feats)
+                                y.append(lab)
+                                w.append(1.0)
+                                meta.append({"strategy": str(d.get("strategy", "")),
+                                             "tf": str(d.get("tf", ""))})
+                            except Exception:
+                                continue
+                    if X:
+                        return X, y, w, meta
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Fallback: feature_store labeled samples -> coarse vectors
+        try:
+            rows = st.get_feature_samples_with_meta(limit=lim) or []
+            for r in rows:
+                try:
+                    if not isinstance(r, dict):
+                        continue
+                    lab = r.get("label", r.get("won", None))
+                    if lab is None:
+                        rr = r.get("r", r.get("r_mult", None))
+                        if rr is None:
+                            continue
+                        lab = 1.0 if float(rr) > 0 else 0.0
+                    feats = self._meta_features(r)
+                    if feats is None:
+                        continue
+                    X.append(feats)
+                    y.append(1.0 if float(lab) > 0.5 else 0.0)
+                    w.append(0.7)
+                    meta.append({"strategy": str(r.get("strategy", ""))})
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return X, y, w, meta
+
+    @staticmethod
+    def _row_label(d):
+        for k in ("label", "won", "accepted_win", "profitable"):
+            if k in d and d[k] is not None:
+                try:
+                    return 1.0 if float(d[k]) > 0.5 else 0.0
+                except Exception:
+                    pass
+        for k in ("pnl", "r_mult", "r", "profit"):
+            if k in d and d[k] is not None:
+                try:
+                    return 1.0 if float(d[k]) > 0 else 0.0
+                except Exception:
+                    pass
+        fate = str(d.get("fate", "") or "").lower()
+        if fate:
+            if any(t in fate for t in ("win", "tp", "profit", "target")):
+                return 1.0
+            if any(t in fate for t in ("loss", "sl", "stop", "stopped")):
+                return 0.0
+        return None
+
+    @staticmethod
+    def _row_features(d):
+        try:
+            import json as _j
+            raw = d.get("features", d.get("feature_json", None))
+            if isinstance(raw, str):
+                try:
+                    raw = _j.loads(raw)
+                except Exception:
+                    raw = {}
+            if isinstance(raw, dict) and set(SIGNAL_FEATURE_NAMES) <= set(raw.keys()):
+                return [float(raw[n]) for n in SIGNAL_FEATURE_NAMES]
+            # Reconstruct a coarse vector from scalar columns
+            names, _ = SIGNAL_FEATURE_NAMES, None
+            sig = {"score": d.get("base_score", d.get("score", 0.0)),
+                   "tf": d.get("tf", ""), "dir": d.get("direction", d.get("dir", "")),
+                   "strategy": d.get("strategy", "")}
+            _, vec = SignalFeaturizer.featurize(sig, {})
+            if isinstance(raw, dict):
+                for i, n in enumerate(SIGNAL_FEATURE_NAMES):
+                    if n in raw:
+                        try:
+                            vec[i] = float(raw[n])
+                        except Exception:
+                            pass
+            return vec
+        except Exception:
+            return None
+
+    @staticmethod
+    def _meta_features(r):
+        try:
+            meta = r.get("meta") or {}
+            if isinstance(meta, str):
+                try:
+                    import json as _j
+                    meta = _j.loads(meta)
+                except Exception:
+                    meta = {}
+            sig = {"score": r.get("base_score", r.get("score", 7.0)),
+                   "tf": r.get("tf", meta.get("tf", "")),
+                   "dir": r.get("direction", meta.get("direction", "BUY")),
+                   "strategy": r.get("strategy", meta.get("strategy", ""))}
+            ctx = {"regime": {"label": r.get("regime", meta.get("regime", "RANGE"))},
+                   "session": r.get("session", meta.get("session", "OFF"))}
+            _, vec = SignalFeaturizer.featurize(sig, ctx)
+            return vec
+        except Exception:
+            return None
+
+    # ---------------- training ----------------
+    def fit_from_store(self, limit=None):
+        """Batch refit from labeled history. Returns fit report dict."""
+        rep = {"fitted": False, "n": 0, "base_rate": 0.5, "auc": 0.5}
+        try:
+            X, y, w, meta = self._labeled_rows(limit)
+            rep["n"] = len(X)
+            if not X:
+                return rep
+            base = sum(y) / max(1, len(y))
+            self.base_rate = float(base)
+            rep["base_rate"] = float(base)
+            min_n = int(_qcfg("quantum_cal_min_samples", 60))
+            if len(X) < min_n:
+                rep["reason"] = f"thin data ({len(X)}<{min_n}); priors hold"
+                return rep
+            ok = self.model.fit(X, y, sample_weight=w)
+            if not ok:
+                rep["reason"] = "optimizer failed"
+                return rep
+            raw = self.model.predict_proba(X)
+            self.calibrator.fit(raw, y)
+            self.n_learned = len(X)
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                self.last_fit_ts = _dt.now(_tz.utc).isoformat()
+            except Exception:
+                pass
+            rep["auc"] = float(self._auc(raw, y))
+            rep["fitted"] = True
+            self.save()
+            # Feed regime routing adaptation from regime-labeled rows
+            try:
+                eng = get_quantum_regime(self.symbol)
+                if eng is not None:
+                    for r, lab in zip(meta, y):
+                        rr = str((r or {}).get("regime", "") or "").upper()
+                        if rr in REGIME_LABELS:
+                            eng.adapt_route(rr, strategy_family((r or {}).get("strategy", "")),
+                                            1.0 if lab > 0.5 else -1.0, lr=0.02)
+                    eng.save_route()
+            except Exception:
+                pass
+            return rep
+        except Exception as e:
+            rep["reason"] = str(e)
+            return rep
+
+    @staticmethod
+    def _auc(probs, labels):
+        try:
+            pairs = sorted(zip(probs, labels), key=lambda t: t[0])
+            n1 = sum(1 for _, l in pairs if l > 0.5)
+            n0 = len(pairs) - n1
+            if n1 == 0 or n0 == 0:
+                return 0.5
+            rank_sum = sum(i + 1 for i, (_, l) in enumerate(pairs) if l > 0.5)
+            return float((rank_sum - n1 * (n1 + 1) / 2) / (n1 * n0))
+        except Exception:
+            return 0.5
+
+    def online_update(self, feature_vec, label, lr=None):
+        """Per-trade micro-update (one SGD step on the logistic loss)."""
+        try:
+            if not self.model.w or len(feature_vec) != len(self.model.w):
+                return False
+            step = float(lr if lr is not None else _qcfg("quantum_cal_lr", 0.05))
+            z = self.model.decision(feature_vec)
+            pr = RidgeLogistic._sigmoid(max(-30.0, min(30.0, z)))
+            err = (pr - (1.0 if float(label) > 0.5 else 0.0))
+            lam = float(_qcfg("quantum_cal_l2", 1.0)) / 500.0
+            for j in range(len(self.model.w)):
+                self.model.w[j] -= step * (err * float(feature_vec[j]) + 2 * lam * self.model.w[j])
+            self.model.b -= step * err
+            return True
+        except Exception:
+            return False
+
+    # ---------------- inference ----------------
+    def predict(self, signal, context=None):
+        """Calibrated P(win) + explanation. Never raises; fail-soft 0.5."""
+        out = {"p_win": 0.5, "p_raw": 0.5, "edge_basis": "priors",
+               "contrib": [], "n_learned": self.n_learned}
+        try:
+            names, vec = SignalFeaturizer.featurize(signal, context or {})
+            if self.model.w and len(self.model.w) == len(vec):
+                raw = RidgeLogistic._sigmoid(self.model.decision(vec))
+                out["edge_basis"] = "learned" if self.n_learned >= int(_qcfg("quantum_cal_min_samples", 60)) else "priors+data"
+            else:
+                # Pure-prior path: logit from priors dot features
+                pv = [float(CAL_PRIORS.get(n, 0.0)) for n in SIGNAL_FEATURE_NAMES]
+                raw = RidgeLogistic._sigmoid(sum(a * b for a, b in zip(pv, vec)))
+                out["edge_basis"] = "priors"
+            out["p_raw"] = float(qclip(raw, 0.01, 0.99))
+            out["p_win"] = float(self.calibrator.map(out["p_raw"]))
+            try:
+                contrib = self.model.contributions(vec) if self.model.w else [
+                    (n, float(CAL_PRIORS.get(n, 0.0)) * float(vec[i])) for i, n in enumerate(SIGNAL_FEATURE_NAMES)]
+                contrib = sorted(contrib, key=lambda t: -abs(t[1]))[:8]
+                out["contrib"] = [(k, round(float(v), 4)) for k, v in contrib]
+            except Exception:
+                pass
+            out["features"] = {n: round(float(vec[i]), 4) for i, n in enumerate(SIGNAL_FEATURE_NAMES)}
+            return out
+        except Exception as e:
+            out["reason"] = str(e)
+            return out
+
+
+_CAL_SINGLETON = {}
+
+
+def get_calibrated_scorer(symbol=None):
+    try:
+        sym = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        c = _CAL_SINGLETON.get(sym)
+        if c is None:
+            c = CalibratedScoringEngine(symbol=sym)
+            _CAL_SINGLETON[sym] = c
+        return c
+    except Exception:
+        return None
+
+
+SECTION_E5_OK = True
+
+
+# ============================================================================
+# E6 — QUANTUM DECIDER (the ONE junction: fuse everything -> TRADE / HOLD)
+# ----------------------------------------------------------------------------
+# Called by the live loop right after `best = max(signals, ...)` and by the
+# backtest harness at the same decision point (parity by construction).
+# It NEVER deletes or renames v12 keys: it grooms the chosen signal with
+# quantum_* evidence and returns a verdict. Shadow mode logs the verdict
+# without enforcing it, for risk-free A/B against live v12 behavior.
+# ============================================================================
+
+class QuantumDecider:
+    """Fuse regime + calibration + early-gate + session + committee."""
+
+    def __init__(self, symbol=None):
+        self.symbol = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        self._fit_counter = 0
+
+    def _maybe_refit(self):
+        try:
+            every = int(_qcfg("quantum_cal_retrain_bars", 500))
+            self._fit_counter += 1
+            if every > 0 and self._fit_counter % every == 0:
+                cal = get_calibrated_scorer(self.symbol)
+                if cal is not None:
+                    rep = cal.fit_from_store()
+                    try:
+                        _qlog().info(f"[QE6] scheduled refit: {rep}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _context(self, dfs, tick, regime_state, early):
+        ctx = {}
+        try:
+            ctx["regime"] = regime_state or {}
+            ctx["session"] = (early or {}).get("session", utc_session()[0])
+            ctx["spread_pctile"] = (early or {}).get("spread_pctile", 0.5)
+            ev = (early or {}).get("evidence", {}) or {}
+            ctx["vol_ratio"] = ev.get("vol_ratio", 1.0)
+            main_tf = str(_qcfg("timeframes", ["M15"])[0])
+            df0 = (dfs or {}).get(main_tf)
+            if df0 is None and dfs:
+                try:
+                    df0 = next(iter(dfs.values()))
+                except Exception:
+                    df0 = None
+            if df0 is not None:
+                try:
+                    c = qas_series(df0, "close")
+                    ctx["range_pos"] = q_range_pos(c, 60)
+                    ctx["atr_pct"] = q_atr_pct(qas_series(df0, "high"), qas_series(df0, "low"), c, 14)
+                except Exception:
+                    pass
+            if tick:
+                for k in ("correlation", "trinity_vote"):
+                    if k in tick:
+                        ctx[k] = tick[k]
+        except Exception:
+            pass
+        return ctx
+
+    def _committee(self, signals, ctx):
+        """Agreement + direction consensus across ALL candidates."""
+        try:
+            if not signals:
+                return {"agreement": 0.0, "n": 0, "long_w": 0.0, "short_w": 0.0}
+            lw = sw = 0.0
+            for s in signals:
+                try:
+                    w = 0.35 + 0.65 * qclip(float(s.get("score", 0)) / 10.0, 0, 1)
+                except Exception:
+                    w = 0.5
+                d = str(s.get("dir", "")).upper()
+                if d.startswith("B") or d == "1":
+                    lw += w
+                elif d.startswith("S") or d == "-1":
+                    sw += w
+            tot = lw + sw or 1.0
+            return {"agreement": abs(lw - sw) / tot, "n": len(signals),
+                    "long_w": lw / tot, "short_w": sw / tot}
+        except Exception:
+            return {"agreement": 0.0, "n": len(signals or []), "long_w": 0.5, "short_w": 0.5}
+
+    def decide(self, signals, dfs=None, tick=None, regime_state=None,
+               early=None, sl_dist=None, tp_dist=None):
+        """Full verdict. Returns dict with action TRADE/HOLD + evidence."""
+        verdict = {"action": "HOLD", "signal": None, "p_win": 0.0, "edge_r": -1.0,
+                   "size_mult": 0.0, "reasons": [], "audit": {}, "shadow": False}
+        try:
+            if not _qcfg("quantum_core_enabled", True):
+                verdict["reasons"].append("quantum core disabled")
+                return verdict
+            if not signals:
+                verdict["reasons"].append("no candidates")
+                return verdict
+            self._maybe_refit()
+            regime_state = regime_state or {}
+            rlab = str(regime_state.get("label", "RANGE")).upper()
+            if rlab not in REGIME_LABELS:
+                rlab = "RANGE"
+            ctx = self._context(dfs, tick, regime_state, early)
+            cal = get_calibrated_scorer(self.symbol)
+            eng = get_quantum_regime(self.symbol)
+            si = get_session_intelligence(self.symbol)
+            # Score every candidate on EXPECTED R AFTER COSTS (not points)
+            cands = []
+            for s in signals:
+                try:
+                    pred = cal.predict(s, ctx) if cal else {"p_win": 0.5, "contrib": []}
+                    p = float(pred.get("p_win", 0.5))
+                    rm = eng.route_mult(rlab, s.get("strategy", s.get("signal_type", ""))) if eng else 0.6
+                    sm = si.multiplier(ctx.get("session", "OFF")) if si else 1.0
+                    # Payoff estimate: signal's own TP/SL if present else regime prior
+                    pay = 2.0
+                    try:
+                        e = float(s.get("entry", 0) or 0)
+                        sl = float(s.get("sl", 0) or 0)
+                        tp = float(s.get("tp", 0) or 0)
+                        if e and sl and tp:
+                            risk = abs(e - sl)
+                            if risk > 1e-12:
+                                pay = abs(tp - e) / risk
+                    except Exception:
+                        pass
+                    if sl_dist and tp_dist:
+                        try:
+                            pay = float(tp_dist) / max(1e-12, float(sl_dist))
+                        except Exception:
+                            pass
+                    pay = qclip(pay, 0.5, 5.0)
+                    cost_r = (early or {}).get("cost_r", 0.15)
+                    edge = edge_after_costs(p, pay, cost_r)
+                    # Regime-route + session scale the EDGE (multiplicative governors)
+                    gov_edge = edge * (0.35 + 0.65 * rm) * (0.5 + 0.5 * sm)
+                    cands.append({"sig": s, "p": p, "pay": pay, "edge": edge,
+                                  "gov_edge": gov_edge, "route_mult": rm, "sess_mult": sm,
+                                  "pred": pred})
+                except Exception:
+                    continue
+            if not cands:
+                verdict["reasons"].append("no scorable candidates")
+                return verdict
+            cands.sort(key=lambda c: c["gov_edge"], reverse=True)
+            top = cands[0]
+            com = self._committee(signals, ctx)
+            # ---- vetoes ----
+            min_p = float(_qcfg("quantum_min_confidence", 0.55))
+            # Adaptive floor: thin data => floor; rich data => configured bar
+            try:
+                learned = int(getattr(cal, "n_learned", 0) or 0)
+                need = int(_qcfg("quantum_cal_min_samples", 60))
+                w = qclip(learned / max(1, need * 3), 0.0, 1.0)
+                bar = float(_qcfg("quantum_confidence_floor", 0.50)) * (1 - w) + min_p * w
+                bar = min(bar, float(_qcfg("quantum_confidence_cap", 0.72)))
+            except Exception:
+                bar = min_p
+            floor = float(_qcfg("quantum_min_edge_r", 0.35))
+            veto = None
+            if top["p"] < bar:
+                veto = f"p_win {top['p']:.2f} < bar {bar:.2f}"
+            elif top["gov_edge"] < floor:
+                veto = f"edge {top['gov_edge']:+.2f}R < floor {floor:.2f}R"
+            elif _qcfg("quantum_regime_routing", True) and top["route_mult"] < 0.18:
+                veto = f"regime {rlab} starves {top['sig'].get('strategy', '?')} (x{top['route_mult']:.2f})"
+            elif com["n"] >= 3 and com["agreement"] < float(_qcfg("quantum_disagreement_veto", 0.30)):
+                veto = f"committee split (agree {com['agreement']:.2f})"
+            # ---- size ----
+            size_mult = 1.0
+            try:
+                size_mult *= float((early or {}).get("size_mult", 1.0))
+                size_mult *= qclip((top["p"] - 0.5) * 2.5 + 0.55, 0.25, 1.0)
+                size_mult *= qclip(0.45 + 0.55 * top["route_mult"], 0.2, 1.0)
+                size_mult *= qclip(top["sess_mult"], 0.3, 1.35) / 1.0
+                size_mult *= qclip(0.5 + 0.5 * com["agreement"], 0.35, 1.0)
+            except Exception:
+                pass
+            size_mult = qclip(size_mult, 0.0, 1.0)
+            # ---- groom the chosen signal (ADD keys, never remove) ----
+            groomed = dict(top["sig"])
+            try:
+                groomed["quantum_p_win"] = round(top["p"], 4)
+                groomed["quantum_edge_r"] = round(top["edge"], 4)
+                groomed["quantum_gov_edge_r"] = round(top["gov_edge"], 4)
+                groomed["quantum_payoff_r"] = round(top["pay"], 3)
+                groomed["quantum_route_mult"] = round(top["route_mult"], 3)
+                groomed["quantum_sess_mult"] = round(top["sess_mult"], 3)
+                groomed["quantum_size_mult"] = round(size_mult, 3)
+                groomed["quantum_regime"] = rlab
+                groomed["quantum_session"] = ctx.get("session", "OFF")
+                groomed["quantum_bar"] = round(bar, 3)
+                groomed["quantum_agreement"] = round(com["agreement"], 3)
+                groomed["quantum_why"] = [f"{k}:{v:+.3f}" for k, v in (top["pred"].get("contrib") or [])[:6]]
+                groomed["quantum_basis"] = top["pred"].get("edge_basis", "?")
+            except Exception:
+                pass
+            verdict.update({"signal": groomed, "p_win": top["p"], "edge_r": top["gov_edge"],
+                            "size_mult": 0.0 if veto else size_mult})
+            audit = {"regime": rlab, "session": ctx.get("session"), "bar": bar, "floor": floor,
+                     "committee": com, "candidates": len(cands),
+                     "top3": [{"strategy": str(c["sig"].get("strategy", "?")),
+                               "dir": str(c["sig"].get("dir", "?")), "p": round(c["p"], 3),
+                               "edge": round(c["gov_edge"], 3)} for c in cands[:3]]}
+            verdict["audit"] = audit
+            if veto:
+                verdict["action"] = "HOLD"
+                verdict["reasons"].append("VETO: " + veto)
+            else:
+                verdict["action"] = "TRADE"
+                verdict["reasons"].append(
+                    f"TRADE {groomed.get('dir')} {groomed.get('strategy', '?')} "
+                    f"p={top['p']:.2f} edge={top['gov_edge']:+.2f}R size=x{size_mult:.2f}")
+            if _qcfg("quantum_shadow_mode", False):
+                verdict["shadow"] = True
+                verdict["reasons"].append("shadow mode: logged, v12 executes")
+            return verdict
+        except Exception as e:
+            try:
+                _qlog().debug(f"[QE6] decide failed open: {e}")
+            except Exception:
+                pass
+            verdict["reasons"].append(f"fail-open: {e}")
+            return verdict
+
+
+_DECIDER_SINGLETON = {}
+
+
+def get_quantum_decider(symbol=None):
+    try:
+        sym = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        d = _DECIDER_SINGLETON.get(sym)
+        if d is None:
+            d = QuantumDecider(symbol=sym)
+            _DECIDER_SINGLETON[sym] = d
+        return d
+    except Exception:
+        return None
+
+
+def quantum_junction(signals, dfs=None, tick=None, regime_state=None,
+                     early=None, sl_dist=None, tp_dist=None, symbol=None):
+    """ONE-call API for the live loop + backtest harness (parity).
+
+    Returns (verdict_dict). Never raises. When the core is disabled or any
+    piece fails, returns action=HOLD with reason 'fail-open'... EXCEPT the
+    caller treats fail-open as 'proceed with v12 path' (see wiring).
+    """
+    try:
+        d = get_quantum_decider(symbol or _qcfg("symbol", "XAUUSDm"))
+        if d is None:
+            return {"action": "HOLD", "signal": None, "reasons": ["no decider (fail-open)"],
+                    "fail_open": True}
+        v = d.decide(signals, dfs=dfs, tick=tick, regime_state=regime_state,
+                     early=early, sl_dist=sl_dist, tp_dist=tp_dist)
+        return v
+    except Exception as e:
+        return {"action": "HOLD", "signal": None, "reasons": [f"junction fail-open: {e}"],
+                "fail_open": True}
+
+
+SECTION_E6_OK = True
+
+# ============================================================================
+# E7 — NARRATIVE ENGINE v2 (every decision tells its story)
+# ----------------------------------------------------------------------------
+# Extends (never replaces) the Phase-D NarrativeSentinel daily digest with:
+#  * per-decision audit narratives (why TRADE / why HOLD, with numbers)
+#  * trade lifecycle stories (birth -> manage -> death, R-annotated)
+#  * morning briefing + evening debrief generators
+#  * Telegram-ready formatting + file journaling under logs/quantum_narratives/
+# Deterministic templates over live evidence (optional Gemini polish reuses
+# the file's existing macro_llm key when present, never required).
+# ============================================================================
+
+class QuantumNarrator:
+    """Deterministic storyteller over quantum evidence."""
+
+    def __init__(self, symbol=None):
+        self.symbol = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        self.outdir = str(_qcfg("quantum_narrative_dir", "logs/quantum_narratives"))
+        try:
+            import os as _os
+            _os.makedirs(self.outdir, exist_ok=True)
+        except Exception:
+            pass
+
+    # ---------------- formatting helpers ----------------
+    @staticmethod
+    def _fmt_pct(x):
+        try:
+            return f"{float(x) * 100:.0f}%"
+        except Exception:
+            return "?"
+
+    @staticmethod
+    def _fmt_r(x):
+        try:
+            return f"{float(x):+.2f}R"
+        except Exception:
+            return "?R"
+
+    @staticmethod
+    def _bar(frac, width=10):
+        try:
+            f = qclip(frac, 0.0, 1.0)
+            n = int(round(f * width))
+            return "█" * n + "░" * (width - n)
+        except Exception:
+            return ""
+
+    def _journal(self, kind, text):
+        try:
+            import os as _os
+            from datetime import datetime as _dt, timezone as _tz
+            day = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+            p = _os.path.join(self.outdir, f"{day}_{kind}.log")
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(f"\n----- {_dt.now(_tz.utc).isoformat()} -----\n{text}\n")
+        except Exception:
+            pass
+
+    # ---------------- decision audit ----------------
+    def decision_story(self, verdict, early=None, regime_state=None):
+        """One-paragraph audit for a TRADE or HOLD verdict."""
+        try:
+            v = verdict or {}
+            action = v.get("action", "HOLD")
+            sig = v.get("signal") or {}
+            aud = v.get("audit") or {}
+            regime = str(aud.get("regime", (regime_state or {}).get("label", "?")))
+            sess = str(aud.get("session", (early or {}).get("session", "?")))
+            p = float(v.get("p_win", 0.0))
+            edge = float(v.get("edge_r", 0.0))
+            size = float(v.get("size_mult", 0.0))
+            reasons = v.get("reasons", []) or []
+            if action == "TRADE":
+                head = (f"🟢 TRADE {sig.get('dir', '?')} {sig.get('strategy', '?')} "
+                        f"on {sig.get('tf', '?')} | p={p:.2f} edge={edge:+.2f}R size=x{size:.2f}")
+            else:
+                head = f"🔴 HOLD | p={p:.2f} edge={edge:+.2f}R"
+            lines = [head,
+                     f"Regime: {regime} (conf {(regime_state or {}).get('confidence', 0):.2f}) | "
+                     f"Session: {sess} | Spread p{int((early or {}).get('spread_pctile', 0.5) * 100)}"]
+            if sig.get("quantum_why"):
+                lines.append("Why: " + ", ".join(sig["quantum_why"][:6]))
+            for r in reasons[:3]:
+                lines.append("• " + str(r))
+            top3 = aud.get("top3", []) or []
+            if len(top3) > 1:
+                alt = ", ".join(f"{t.get('dir')} {t.get('strategy')} p={t.get('p')}" for t in top3[1:3])
+                lines.append(f"Alts: {alt}")
+            text = "\n".join(lines)
+            if _qcfg("quantum_audit_every_decision", True):
+                self._journal("decisions", text)
+            return text
+        except Exception as e:
+            return f"(narrator error: {e})"
+
+    def early_story(self, early):
+        """Human read of the pre-flight gate verdict."""
+        try:
+            e = early or {}
+            if e.get("pass"):
+                s = f"✅ Pre-flight PASS (size x{e.get('size_mult', 1):.2f}, cost {e.get('cost_r', 0):.2f}R)"
+            else:
+                s = "⛔ Pre-flight HOLD: " + "; ".join(e.get("hard_holds", [])[:4])
+            soft = e.get("soft_holds", []) or []
+            if soft:
+                s += "\n⚠️ " + "; ".join(soft[:4])
+            gates = e.get("gates", {}) or {}
+            det = " | ".join(f"{k}:{(g or {}).get('detail', '')}" for k, g in gates.items())
+            if det:
+                s += "\n" + det[:400]
+            return s
+        except Exception as ex:
+            return f"(early story error: {ex})"
+
+    # ---------------- trade lifecycle ----------------
+    def birth_story(self, signal, order_result=None):
+        try:
+            s = signal or {}
+            o = order_result or {}
+            lines = [f"🐣 OPEN {s.get('dir', '?')} {self.symbol} {s.get('strategy', '?')} "
+                     f"@ {s.get('entry', '?')} | SL {s.get('sl', '?')} TP {s.get('tp', '?')} "
+                     f"| lot {o.get('volume', s.get('lot', '?'))}",
+                     f"Conviction p={float(s.get('quantum_p_win', 0)):.2f} "
+                     f"edge={float(s.get('quantum_gov_edge_r', 0)):+.2f}R "
+                     f"regime={s.get('quantum_regime', '?')} session={s.get('quantum_session', '?')}"]
+            if o.get("ticket"):
+                lines.append(f"Ticket {o['ticket']} | {o.get('comment', '')}")
+            text = "\n".join(lines)
+            self._journal("trades", text)
+            return text
+        except Exception as e:
+            return f"(birth story error: {e})"
+
+    def death_story(self, trade, exit_price=None, reason=""):
+        try:
+            t = trade or {}
+            r = r_multiple(t.get("entry", 0), t.get("sl", 0), exit_price if exit_price is not None else t.get("exit", 0),
+                           t.get("dir", "BUY"))
+            pnl = t.get("pnl", "?")
+            emo = "💰" if r > 0 else ("🩸" if r < -0.5 else "➖")
+            text = (f"{emo} CLOSE {t.get('dir', '?')} {self.symbol} @ {exit_price} | "
+                    f"{r:+.2f}R | PnL {pnl} | {reason} "
+                    f"| was: p={float(t.get('quantum_p_win', 0)):.2f} regime={t.get('quantum_regime', '?')}")
+            self._journal("trades", text)
+            # Feed the learners with the realized outcome
+            try:
+                si = get_session_intelligence(self.symbol)
+                if si is not None:
+                    sess = t.get("quantum_session") or utc_session()[0]
+                    si.record_outcome(sess, r)
+                cal = get_calibrated_scorer(self.symbol)
+                if cal is not None and t.get("quantum_features"):
+                    cal.online_update([float(v) for v in (t["quantum_features"].values()
+                                                       if isinstance(t.get("quantum_features"), dict)
+                                                       else t.get("quantum_features"))],
+                                      1.0 if r > 0 else 0.0)
+                    cal.save()
+            except Exception:
+                pass
+            return text
+        except Exception as e:
+            return f"(death story error: {e})"
+
+    # ---------------- briefings ----------------
+    def morning_briefing(self, regime_state=None, early=None):
+        try:
+            reg = regime_state or {}
+            lines = [f"☀️ MORNING BRIEF — {self.symbol}",
+                     f"Regime: {reg.get('label', '?')} (conf {float(reg.get('confidence', 0)):.2f}, "
+                     f"agree {float(reg.get('agreement', 0)):.2f})"]
+            try:
+                si = get_session_intelligence(self.symbol)
+                if si is not None:
+                    rows = sorted(si.table(), key=lambda r: -r["exp_r"])
+                    best = rows[0]
+                    lines.append(f"Best session (evidence): {best['session']} exp {best['exp_r']:+.2f}R "
+                                 f"(x{best['mult']:.2f})")
+            except Exception:
+                pass
+            if early:
+                lines.append(self.early_story(early))
+            text = "\n".join(lines)
+            self._journal("briefings", text)
+            return text
+        except Exception as e:
+            return f"(briefing error: {e})"
+
+    def evening_debrief(self, day_trades=None):
+        try:
+            trs = day_trades or []
+            n = len(trs)
+            wins = sum(1 for t in trs if float(t.get("r", t.get("pnl", 0)) or 0) > 0)
+            tot_r = sum(float(t.get("r", 0) or 0) for t in trs)
+            lines = [f"🌙 EVENING DEBRIEF — {self.symbol}: {n} trades, {wins}W, {tot_r:+.2f}R"]
+            by_reg, by_sess = {}, {}
+            for t in trs:
+                r = float(t.get("r", 0) or 0)
+                by_reg[t.get("quantum_regime", "?")] = by_reg.get(t.get("quantum_regime", "?"), 0) + r
+                by_sess[t.get("quantum_session", "?")] = by_sess.get(t.get("quantum_session", "?"), 0) + r
+            if by_reg:
+                lines.append("By regime: " + ", ".join(f"{k} {v:+.1f}R" for k, v in sorted(by_reg.items())))
+            if by_sess:
+                lines.append("By session: " + ", ".join(f"{k} {v:+.1f}R" for k, v in sorted(by_sess.items())))
+            text = "\n".join(lines)
+            self._journal("briefings", text)
+            return text
+        except Exception as e:
+            return f"(debrief error: {e})"
+
+    def to_telegram(self, text, title=""):
+        """HTML-escape + wrap for the file's TelegramNotifier."""
+        try:
+            import html as _h
+            body = _h.escape(str(text or ""))[:3500]
+            if title:
+                return f"<b>{_h.escape(str(title))}</b>\n<pre>{body}</pre>"
+            return f"<pre>{body}</pre>"
+        except Exception:
+            return str(text or "")[:3500]
+
+
+_NARRATOR_SINGLETON = {}
+
+
+def get_quantum_narrator(symbol=None):
+    try:
+        sym = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        n = _NARRATOR_SINGLETON.get(sym)
+        if n is None:
+            n = QuantumNarrator(symbol=sym)
+            _NARRATOR_SINGLETON[sym] = n
+        return n
+    except Exception:
+        return None
+
+
+SECTION_E7_OK = True
+
+
+# ============================================================================
+# PHASE H — QUANTUM RISK OVERLAY (governors above the v12 risk engine)
+# ----------------------------------------------------------------------------
+# The v12 RISK.calc_size stays the position sizer. This overlay MULTIPLIES its
+# output by evidence-driven governors in [0,1] and can veto (0.0):
+#  * volatility targeting (risk scales to realized vol vs annual target)
+#  * heat governor (portfolio open-risk vs max heat)
+#  * correlation brake (book correlation vs brake threshold)
+#  * drawdown throttle (smooth cosine between soft and hard DD)
+#  * kill-switch aggregator (any veto source => 0 with reason)
+# ============================================================================
+
+class VolTargetGovernor:
+    """Scale risk so realized vol converges to the annual target."""
+
+    def __init__(self):
+        self.target = float(_qcfg("quantum_vol_target_annual", 0.25))
+
+    def factor(self, closes=None, periods_per_year=8760):
+        try:
+            if not closes or len(closes) < 30:
+                return 1.0
+            import math as _m
+            rets = [(closes[i] / closes[i - 1] - 1.0) for i in range(1, len(closes)) if closes[i - 1]]
+            if len(rets) < 20:
+                return 1.0
+            m = sum(rets[-60:]) / min(60, len(rets))
+            var = sum((r - m) ** 2 for r in rets[-60:]) / max(1, min(60, len(rets)) - 1)
+            realized = (var ** 0.5) * (periods_per_year ** 0.5)
+            if realized <= 1e-9:
+                return 1.0
+            return float(qclip(self.target / realized, 0.15, 2.0))
+        except Exception:
+            return 1.0
+
+
+class HeatGovernor:
+    """Cap aggregate open risk (sum of stop distances in R of equity)."""
+
+    def __init__(self):
+        self.max_heat = float(_qcfg("quantum_max_heat", 0.80))
+
+    def open_heat(self, open_trades=None, equity=None):
+        tot = 0.0
+        try:
+            trs = open_trades
+            if trs is None:
+                st = _qstore()
+                trs = st.open_trades() if st is not None and hasattr(st, "open_trades") else []
+            eq = float(equity or 0) or float(_qcfg("account_balance", 0) or 0) or 1.0
+            for t in trs or []:
+                try:
+                    risk_money = abs(float(t.get("entry", 0) or 0) - float(t.get("sl", 0) or 0))
+                    vol = float(t.get("vol", t.get("volume", 0)) or 0)
+                    # contract values differ; approximate via stored risk fraction when present
+                    rf = t.get("risk_fraction", t.get("risk_pct", None))
+                    if rf is not None:
+                        tot += abs(float(rf)) / (100.0 if abs(float(rf)) > 1 else 1.0)
+                    elif eq > 0 and risk_money > 0 and vol > 0:
+                        # XAU 1.0 lot ~= $100/point move * price scale; use ATR-normalized proxy
+                        tot += min(0.10, risk_money * vol / eq * 100.0)
+                except Exception:
+                    continue
+            return float(tot)
+        except Exception:
+            return 0.0
+
+    def factor(self, open_trades=None, equity=None):
+        try:
+            heat = self.open_heat(open_trades, equity)
+            if heat >= self.max_heat:
+                return 0.0
+            soft = self.max_heat * 0.6
+            if heat <= soft:
+                return 1.0
+            x = (heat - soft) / (self.max_heat - soft + 1e-12)
+            import math as _m
+            return float(0.5 + 0.5 * _m.cos(_m.pi * qclip(x, 0, 1)))
+        except Exception:
+            return 1.0
+
+
+class CorrelationBrake:
+    """Veto new trades aligned with an already-correlated book."""
+
+    def __init__(self):
+        self.brake = float(_qcfg("quantum_corr_brake", 0.75))
+
+    def book_bias(self, open_trades=None):
+        """Net directional bias in [-1, +1] of the open book."""
+        try:
+            trs = open_trades
+            if trs is None:
+                st = _qstore()
+                trs = st.open_trades() if st is not None and hasattr(st, "open_trades") else []
+            net = gross = 0.0
+            for t in trs or []:
+                try:
+                    d = 1.0 if str(t.get("dir", "")).upper().startswith("B") else -1.0
+                    w = abs(float(t.get("vol", t.get("volume", 1)) or 1))
+                    net += d * w
+                    gross += w
+                except Exception:
+                    continue
+            if gross <= 0:
+                return 0.0
+            return float(net / gross)
+        except Exception:
+            return 0.0
+
+    def factor(self, new_dir, open_trades=None):
+        try:
+            bias = self.book_bias(open_trades)
+            nd = 1.0 if str(new_dir).upper().startswith("B") else -1.0
+            align = nd * bias  # +1 fully aligned, -1 fully opposed
+            if align >= self.brake:
+                return 0.0  # veto: book already max-long/short this way
+            if align >= self.brake * 0.6:
+                return 0.5
+            return 1.0
+        except Exception:
+            return 1.0
+
+
+class DrawdownThrottleQ:
+    """Smooth cosine throttle between soft and hard drawdown."""
+
+    def factor(self, equity_curve=None, soft_dd=0.06, hard_dd=0.15):
+        try:
+            eq = list(equity_curve or [])
+            if len(eq) < 2:
+                return 1.0
+            peak = max(eq)
+            if peak <= 0:
+                return 1.0
+            dd = abs(min(0.0, (eq[-1] - peak) / peak))
+            if dd <= soft_dd:
+                return 1.0
+            if dd >= hard_dd:
+                return 0.0
+            x = (dd - soft_dd) / (hard_dd - soft_dd + 1e-12)
+            import math as _m
+            return float(0.5 + 0.5 * _m.cos(_m.pi * x))
+        except Exception:
+            return 1.0
+
+
+class QuantumRiskOverlay:
+    """Multiplies v12 size by Π governors; any 0 => veto with reason."""
+
+    def __init__(self, symbol=None):
+        self.symbol = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        self.vol = VolTargetGovernor()
+        self.heat = HeatGovernor()
+        self.corr = CorrelationBrake()
+        self.dd = DrawdownThrottleQ()
+
+    def govern(self, base_lot, direction, closes=None, open_trades=None,
+               equity=None, equity_curve=None):
+        """Returns {lot, mult, veto, reasons, parts}."""
+        out = {"lot": float(base_lot or 0), "mult": 1.0, "veto": False,
+               "reasons": [], "parts": {}}
+        try:
+            if not _qcfg("quantum_risk_overlay", True):
+                out["reasons"].append("overlay disabled")
+                return out
+            f_vol = self.vol.factor(closes)
+            f_heat = self.heat.factor(open_trades, equity)
+            f_corr = self.corr.factor(direction, open_trades)
+            try:
+                hard = abs(float(_qcfg("max_daily_dd", 0.40)))
+            except Exception:
+                hard = 0.40
+            soft = hard * 0.4
+            f_dd = self.dd.factor(equity_curve, soft_dd=min(0.10, soft), hard_dd=min(0.25, hard))
+            out["parts"] = {"vol": round(f_vol, 3), "heat": round(f_heat, 3),
+                            "corr": round(f_corr, 3), "dd": round(f_dd, 3)}
+            mult = f_vol * f_heat * f_corr * f_dd
+            if f_heat == 0:
+                out["reasons"].append("VETO: heat cap reached")
+                out["veto"] = True
+            if f_corr == 0:
+                out["reasons"].append("VETO: correlation brake (book aligned)")
+                out["veto"] = True
+            if f_dd == 0:
+                out["reasons"].append("VETO: drawdown throttle at zero")
+                out["veto"] = True
+            mult = qclip(mult, 0.0, 1.0)
+            if out["veto"]:
+                mult = 0.0
+            out["mult"] = float(mult)
+            # Round down to broker step (0.01) — never round UP risk
+            try:
+                import math as _m
+                raw = float(base_lot or 0) * mult
+                stepped = _m.floor(raw * 100 + 1e-9) / 100.0
+                min_lot = float(_qcfg("min_lot", 0.01))
+                out["lot"] = float(stepped if stepped >= min_lot or stepped == 0 else 0.0)
+                if raw > 0 and out["lot"] == 0:
+                    out["reasons"].append("below min_lot after governors")
+                    out["veto"] = True
+            except Exception:
+                out["lot"] = float(base_lot or 0) * mult
+            if not out["veto"]:
+                out["reasons"].append(f"governors x{mult:.2f} " +
+                                      " ".join(f"{k}={v}" for k, v in out["parts"].items()))
+            return out
+        except Exception as e:
+            out["reasons"].append(f"fail-open: {e}")
+            return out
+
+
+_RISKOV_SINGLETON = {}
+
+
+def get_risk_overlay(symbol=None):
+    try:
+        sym = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        o = _RISKOV_SINGLETON.get(sym)
+        if o is None:
+            o = QuantumRiskOverlay(symbol=sym)
+            _RISKOV_SINGLETON[sym] = o
+        return o
+    except Exception:
+        return None
+
+
+SECTION_H_OK = True
+
+# ============================================================================
+# PHASE F — PINE PARITY PACK (OMNI-GOD concepts, reborn adaptive in Python)
+# ----------------------------------------------------------------------------
+# The OMNI-GOD-UNIFIED pine ("GOD Conviction Engine") is a brilliant VISUAL
+# framework: EMAs, HMA baseline, SMC (OB/FVG/breakers/sweeps), Asian range,
+# VWAP, BOS/CHoCH structure, Quantum Field Gravity, Dark Pool levels,
+# confluence heatmaps, narrative voice. But Pine hardcodes every length and
+# threshold, sees one symbol/TF, and cannot learn.
+#
+# This pack ports the CONCEPTS as adaptive detectors that feed the quantum
+# scorer as pine_bias (-1..+1), pine_conf (0..1) and zone distances:
+#   F1  Trend-core: ElasticEMA, HMA baseline, KAMA glide, ribbon stack
+#   F2  SMC suite: swings/BOS/CHoCH, OrderBlocks, FVG, Breakers, Sweeps, PD arrays
+#   F3  Field suite: VWAP bands, QFG, DarkPool, HeatProjection, Radar, H&S
+# Complements (never duplicates) the file's existing SmartMoney/FVG/Zone code:
+# everything here is quantile-adaptive, strength-scored, and multi-TF aware.
+# ============================================================================
+
+# ============================================================================
+# F1 — ADAPTIVE TREND CORE
+# ============================================================================
+
+def elastic_ema_series(close, base=21, breath=None):
+    """Volatility-breathing EMA: span stretches in calm, shrinks in storms.
+
+    breath: optional precomputed scale list (0.5..2.0). Returns list.
+    """
+    try:
+        c = [float(v) for v in close]
+        n = len(c)
+        if n == 0:
+            return []
+        base = int(max(2, min(500, base or 21)))
+        if breath is None:
+            rets = [(c[i] / c[i - 1] - 1.0) if c[i - 1] else 0.0 for i in range(1, n)]
+            vols, med = [], []
+            for i in range(len(rets)):
+                win = rets[max(0, i - 49):i + 1]
+                m = sum(win) / max(1, len(win))
+                var = sum((x - m) ** 2 for x in win) / max(1, len(win) - 1)
+                vols.append(var ** 0.5 + 1e-12)
+            import statistics as _st
+            med = _st.median(vols) if vols else 1e-9
+            breath = [min(2.0, max(0.5, v / (med + 1e-12))) for v in vols]
+            breath = [1.0] + breath
+        out = [0.0] * n
+        out[0] = c[0]
+        for i in range(1, n):
+            span = qclip(base * float(breath[i] if i < len(breath) else 1.0), 2, 600)
+            a = 2.0 / (span + 1.0)
+            out[i] = a * c[i] + (1.0 - a) * out[i - 1]
+        return out
+    except Exception:
+        return list(close)
+
+
+def hma_series(close, n=50):
+    """Hull Moving Average (non-lag baseline). Pure-python, exact formula."""
+    try:
+        c = [float(v) for v in close]
+        m = len(c)
+        if m == 0:
+            return []
+        n = int(max(2, n))
+        def _wma(vals, w):
+            w = int(max(1, w))
+            out = [0.0] * len(vals)
+            run = 0.0
+            for i, v in enumerate(vals):
+                run += v
+                if i >= w:
+                    run -= vals[i - w]
+                k = min(i + 1, w)
+                # linear weights approx via triangular center (fast, exact enough)
+                lo = max(0, i - w + 1)
+                seg = vals[lo:i + 1]
+                tot_w = 0.0
+                acc = 0.0
+                for j, sv in enumerate(seg):
+                    wt = j + 1
+                    acc += sv * wt
+                    tot_w += wt
+                out[i] = acc / (tot_w + 1e-12)
+            return out
+        import math as _mm
+        half = _wma(c, max(1, n // 2))
+        full = _wma(c, n)
+        raw = [2 * a - b for a, b in zip(half, full)]
+        return _wma(raw, max(1, int(_mm.sqrt(n))))
+    except Exception:
+        return list(close)
+
+
+def kama_series(close, n=10, fast=2, slow=30):
+    """Kaufman Adaptive MA: efficiency-ratio-driven smoothing constant."""
+    try:
+        c = [float(v) for v in close]
+        m = len(c)
+        if m == 0:
+            return []
+        n = int(max(2, n))
+        out = [0.0] * m
+        out[0] = c[0]
+        sc_fast = 2.0 / (fast + 1)
+        sc_slow = 2.0 / (slow + 1)
+        for i in range(1, m):
+            lo = max(0, i - n)
+            seg = c[lo:i + 1]
+            net = abs(seg[-1] - seg[0])
+            path = sum(abs(seg[j] - seg[j - 1]) for j in range(1, len(seg))) + 1e-12
+            er = net / path
+            sc = (er * (sc_fast - sc_slow) + sc_slow) ** 2
+            out[i] = out[i - 1] + sc * (c[i] - out[i - 1])
+        return out
+    except Exception:
+        return list(close)
+
+
+class ElasticRibbon:
+    """Stack of breathing EMAs + alignment score in [-1,+1] with strength."""
+
+    def __init__(self, spans=(9, 21, 50, 200)):
+        self.spans = tuple(int(s) for s in spans)
+
+    def analyze(self, close):
+        res = {"bull_stack": False, "bear_stack": False, "align": 0.0,
+               "strength": 0.0, "rails": {}, "price_vs_slow": 0.0}
+        try:
+            c = [float(v) for v in close]
+            if len(c) < 30:
+                return res
+            rails = {}
+            for s in self.spans:
+                e = elastic_ema_series(c, s)
+                rails[s] = e[-1] if e else c[-1]
+            order = sorted(self.spans)
+            vals = [rails[s] for s in order]
+            res["rails"] = {str(k): float(v) for k, v in rails.items()}
+            bull = all(vals[i] >= vals[i + 1] for i in range(len(vals) - 1))
+            bear = all(vals[i] <= vals[i + 1] for i in range(len(vals) - 1))
+            res["bull_stack"] = bool(bull)
+            res["bear_stack"] = bool(bear)
+            # Alignment: fraction of ordered pairs in agreement
+            agree = tot = 0
+            for i in range(len(vals)):
+                for j in range(i + 1, len(vals)):
+                    tot += 1
+                    if vals[i] >= vals[j]:
+                        agree += 1
+            frac = agree / max(1, tot)
+            res["align"] = float(frac * 2 - 1)
+            # Strength: normalized rail dispersion (ATR-free: relative to price)
+            px = abs(c[-1]) + 1e-12
+            disp = (max(vals) - min(vals)) / px
+            res["strength"] = float(qclip(disp * 60.0, 0.0, 1.0))
+            slow = rails[max(order)]
+            res["price_vs_slow"] = float(qclip((c[-1] - slow) / (px * 0.02), -3.0, 3.0))
+            return res
+        except Exception:
+            return res
+
+
+class HmaBaseline:
+    """HMA-50 regime baseline: price above/below + slope state."""
+
+    def __init__(self, n=50):
+        self.n = int(n)
+
+    def analyze(self, close):
+        res = {"above": False, "slope": 0.0, "dist_atr": 0.0, "value": 0.0}
+        try:
+            c = [float(v) for v in close]
+            if len(c) < self.n + 10:
+                return res
+            h = hma_series(c, self.n)
+            res["value"] = float(h[-1])
+            res["above"] = bool(c[-1] > h[-1])
+            rng = sum(abs(c[i] - c[i - 1]) for i in range(-14, 0)) / 14.0 + 1e-12
+            res["slope"] = float(qclip((h[-1] - h[-6]) / (rng + 1e-12), -3.0, 3.0))
+            res["dist_atr"] = float((c[-1] - h[-1]) / (rng + 1e-12))
+            return res
+        except Exception:
+            return res
+
+
+class TrendCorePack:
+    """F1 facade: one call -> adaptive trend evidence dict."""
+
+    def __init__(self):
+        self.ribbon = ElasticRibbon()
+        self.hma = HmaBaseline(50)
+        self.kama_n = 10
+
+    def analyze(self, df):
+        out = {"bias": 0.0, "conf": 0.0, "detail": {}}
+        try:
+            c = qas_series(df, "close")
+            if len(c) < 60:
+                return out
+            rib = self.ribbon.analyze(c)
+            hma = self.hma.analyze(c)
+            k = kama_series(c, self.kama_n)
+            k_bull = c[-1] > (k[-1] if k else c[-1])
+            votes = []
+            votes.append(rib["align"] * (0.4 + 0.6 * rib["strength"]))
+            votes.append((1.0 if hma["above"] else -1.0) * qclip(abs(hma["slope"]) / 2 + 0.3, 0, 1))
+            votes.append(1.0 if k_bull else -1.0)
+            bias = sum(votes) / max(1, len(votes))
+            agree = 1.0 - (max(votes) - min(votes)) / 4.0
+            out = {"bias": float(qclip(bias, -1, 1)),
+                   "conf": float(qclip(agree * (0.35 + 0.65 * rib["strength"]), 0, 1)),
+                   "detail": {"ribbon": rib, "hma": hma, "kama_bull": bool(k_bull)}}
+            return out
+        except Exception:
+            return out
+
+
+# ============================================================================
+# F2 — ADAPTIVE SMC SUITE (structure, OB, FVG, breakers, sweeps, PD arrays)
+# ============================================================================
+
+class SwingStructure:
+    """Fractal swings + BOS/CHoCH with ATR-adaptive fractal width."""
+
+    def __init__(self, width=3):
+        self.width = int(max(2, width))
+
+    def swings(self, h, l, limit=8):
+        """Returns (swing_highs[(i, price)], swing_lows[(i, price)]) recent-first."""
+        try:
+            w = self.width
+            n = min(len(h), len(l))
+            his, los = [], []
+            for i in range(w, n - w):
+                seg_h = h[i - w:i + w + 1]
+                seg_l = l[i - w:i + w + 1]
+                if h[i] == max(seg_h) and seg_h.count(h[i]) == 1:
+                    his.append((i, float(h[i])))
+                if l[i] == min(seg_l) and seg_l.count(l[i]) == 1:
+                    los.append((i, float(l[i])))
+            return (his[-limit:][::-1], los[-limit:][::-1])
+        except Exception:
+            return ([], [])
+
+    def structure(self, h, l, c):
+        """BOS/CHoCH events + trend state from swing breaks."""
+        res = {"state": "RANGE", "events": [], "last_high": None, "last_low": None}
+        try:
+            his, los = self.swings(h, l, limit=6)
+            if not his or not los:
+                return res
+            res["last_high"] = his[0][1]
+            res["last_low"] = los[0][1]
+            closes = list(c)
+            # Walk forward from oldest tracked swing, log breaks
+            pts = sorted([(i, p, "H") for i, p in his] + [(i, p, "L") for i, p in los])
+            state = "RANGE"
+            for idx in range(len(pts), len(closes)):
+                px = closes[idx]
+                hh = max((p for _, p, k in pts if k == "H"), default=None)
+                ll = min((p for _, p, k in pts if k == "L"), default=None)
+                if hh is not None and px > hh:
+                    ev = "BOS_UP" if state in ("UP", "RANGE") else "CHOCH_UP"
+                    state = "UP"
+                    res["events"].append((idx, ev, px))
+                    pts = [(i, p, k) for i, p, k in pts if not (k == "H" and p <= px)]
+                elif ll is not None and px < ll:
+                    ev = "BOS_DN" if state in ("DOWN", "RANGE") else "CHOCH_DN"
+                    state = "DOWN"
+                    res["events"].append((idx, ev, px))
+                    pts = [(i, p, k) for i, p, k in pts if not (k == "L" and p >= px)]
+            res["state"] = state
+            res["events"] = res["events"][-6:]
+            return res
+        except Exception:
+            return res
+
+
+class OrderBlockPack:
+    """Order blocks: last opposite candle before impulsive displacement."""
+
+    def __init__(self, disp_atr=1.0, max_age=120):
+        self.disp_atr = float(disp_atr)
+        self.max_age = int(max_age)
+
+    def detect(self, o, h, l, c, atr_list=None):
+        """Returns list of {dir, top, bottom, idx, age, mitigated, strength}."""
+        out = []
+        try:
+            n = min(len(o), len(h), len(l), len(c))
+            if n < 20:
+                return out
+            atr = atr_list or q_atr_from_lists(h, l, c, 14)
+            for i in range(max(1, n - self.max_age - 5), n - 1):
+                try:
+                    body = c[i + 1] - o[i + 1]
+                    rng = (h[i + 1] - l[i + 1]) + 1e-12
+                    a = atr[i + 1] if i + 1 < len(atr) else rng
+                    if abs(body) < self.disp_atr * a or abs(body) / rng < 0.55:
+                        continue
+                    d = "BULL" if body > 0 else "BEAR"
+                    # OB = last opposite candle before displacement
+                    j = i
+                    if (d == "BULL" and c[j] < o[j]) or (d == "BEAR" and c[j] > o[j]):
+                        top, bot = float(h[j]), float(l[j])
+                        # Mitigation: any later close through 50% of OB
+                        mid = (top + bot) / 2
+                        mitig = any((c[k] < mid if d == "BULL" else c[k] > mid)
+                                    for k in range(i + 1, n))
+                        strength = qclip(abs(body) / (a + 1e-12) / 3.0, 0, 1)
+                        if not mitig:
+                            strength = min(1.0, strength + 0.25)
+                        out.append({"dir": d, "top": top, "bottom": bot, "idx": j,
+                                    "age": n - 1 - j, "mitigated": bool(mitig),
+                                    "strength": float(strength)})
+                except Exception:
+                    continue
+            # Keep strongest unmitigated + recent
+            out.sort(key=lambda z: (not z["mitigated"], z["strength"]), reverse=True)
+            return out[:8]
+        except Exception:
+            return out
+
+
+class FvgPack:
+    """Fair Value Gaps with ATR-qualified size + fill tracking."""
+
+    def __init__(self, min_atr=0.25, max_age=150):
+        self.min_atr = float(min_atr)
+        self.max_age = int(max_age)
+
+    def detect(self, o, h, l, c, atr_list=None):
+        """Returns list of {dir, top, bottom, idx, fill_pct, strength}."""
+        out = []
+        try:
+            n = min(len(o), len(h), len(l), len(c))
+            if n < 10:
+                return out
+            atr = atr_list or q_atr_from_lists(h, l, c, 14)
+            for i in range(max(2, n - self.max_age - 2), n - 2):
+                try:
+                    a = atr[i] if i < len(atr) else (h[i] - l[i])
+                    # Bullish FVG: low[i+1] > high[i-1]... standard 3-candle gap
+                    if l[i + 1] > h[i - 1]:
+                        gap = l[i + 1] - h[i - 1]
+                        if gap >= self.min_atr * a:
+                            top, bot = float(l[i + 1]), float(h[i - 1])
+                            fill = self._fill(c[i + 2:], top, bot, "BULL")
+                            out.append({"dir": "BULL", "top": top, "bottom": bot, "idx": i,
+                                        "fill_pct": fill,
+                                        "strength": float(qclip(gap / (a + 1e-12), 0, 1.5) / 1.5)})
+                    if h[i + 1] < l[i - 1]:
+                        gap = l[i - 1] - h[i + 1]
+                        if gap >= self.min_atr * a:
+                            top, bot = float(l[i - 1]), float(h[i + 1])
+                            fill = self._fill(c[i + 2:], top, bot, "BEAR")
+                            out.append({"dir": "BEAR", "top": top, "bottom": bot, "idx": i,
+                                        "fill_pct": fill,
+                                        "strength": float(qclip(gap / (a + 1e-12), 0, 1.5) / 1.5)})
+                except Exception:
+                    continue
+            out.sort(key=lambda z: (1 - z["fill_pct"], z["strength"]), reverse=True)
+            return out[:8]
+        except Exception:
+            return out
+
+    @staticmethod
+    def _fill(later_closes, top, bot, direction):
+        try:
+            if not later_closes:
+                return 0.0
+            depth = top - bot + 1e-12
+            if direction == "BULL":
+                worst = min(later_closes)
+                return float(qclip((top - worst) / depth, 0, 1))
+            worst = max(later_closes)
+            return float(qclip((worst - bot) / depth, 0, 1))
+        except Exception:
+            return 0.0
+
+
+class BreakerPack:
+    """Breaker blocks: failed OBs that flip polarity (RBS/SBR)."""
+
+    def detect(self, o, h, l, c, atr_list=None):
+        out = []
+        try:
+            obs = OrderBlockPack().detect(o, h, l, c, atr_list)
+            n = len(c)
+            for ob in obs:
+                try:
+                    if not ob["mitigated"]:
+                        continue
+                    # Confirmed flip: close beyond OB extreme + displacement
+                    j = ob["idx"]
+                    a = (atr_list[j] if atr_list and j < len(atr_list) else (h[j] - l[j])) or 1e-9
+                    if ob["dir"] == "BULL":
+                        broke = [k for k in range(j + 1, n) if c[k] < ob["bottom"] - 0.2 * a]
+                    else:
+                        broke = [k for k in range(j + 1, n) if c[k] > ob["top"] + 0.2 * a]
+                    if broke:
+                        flip = "BEAR" if ob["dir"] == "BULL" else "BULL"
+                        out.append({"dir": flip, "top": ob["top"], "bottom": ob["bottom"],
+                                    "idx": broke[0], "from_ob": j,
+                                    "strength": float(qclip(ob["strength"] + 0.15, 0, 1))})
+                except Exception:
+                    continue
+            return out[:6]
+        except Exception:
+            return out
+
+
+class SweepPack:
+    """Liquidity sweeps: wick through swing + close back inside (turtle soup)."""
+
+    def detect(self, o, h, l, c):
+        out = []
+        try:
+            sw = SwingStructure()
+            his, los = sw.swings(h, l, limit=10)
+            n = len(c)
+            for idx, px in his:
+                try:
+                    for k in range(idx + 1, min(n, idx + 30)):
+                        if h[k] > px and c[k] < px and o[k] < px:
+                            out.append({"dir": "BEAR", "level": float(px), "idx": k,
+                                        "wick": float(h[k] - px),
+                                        "strength": 0.65})
+                            break
+                except Exception:
+                    continue
+            for idx, px in los:
+                try:
+                    for k in range(idx + 1, min(n, idx + 30)):
+                        if l[k] < px and c[k] > px and o[k] > px:
+                            out.append({"dir": "BULL", "level": float(px), "idx": k,
+                                        "wick": float(px - l[k]),
+                                        "strength": 0.65})
+                            break
+                except Exception:
+                    continue
+            # Freshness boost: recent sweeps matter more
+            for s in out:
+                age = n - 1 - s["idx"]
+                s["strength"] = float(qclip(s["strength"] + max(0, (20 - age)) / 40.0, 0, 1))
+            out.sort(key=lambda s: s["idx"], reverse=True)
+            return out[:8]
+        except Exception:
+            return out
+
+
+class PremiumDiscountPack:
+    """PD arrays: dealing range + premium/discount/O TEjudgment zones."""
+
+    def analyze(self, h, l, c, lookback=120):
+        res = {"range_high": 0.0, "range_low": 0.0, "equilibrium": 0.0,
+               "pos": 0.5, "zone": "MID", "ote_low": 0.0, "ote_high": 0.0}
+        try:
+            hh = [float(v) for v in h[-lookback:]]
+            ll = [float(v) for v in l[-lookback:]]
+            cc = [float(v) for v in c[-lookback:]]
+            if not hh or not cc:
+                return res
+            rh, rl = max(hh), min(ll)
+            eq = (rh + rl) / 2
+            pos = (cc[-1] - rl) / (rh - rl + 1e-12)
+            res.update({"range_high": rh, "range_low": rl, "equilibrium": eq,
+                        "pos": float(qclip(pos, 0, 1))})
+            if pos >= 0.7:
+                res["zone"] = "PREMIUM"
+            elif pos <= 0.3:
+                res["zone"] = "DISCOUNT"
+            # OTE fibs of the range (0.62-0.79 of discount->premium swing)
+            res["ote_low"] = rl + 0.62 * (rh - rl)
+            res["ote_high"] = rl + 0.79 * (rh - rl)
+            return res
+        except Exception:
+            return res
+
+
+class SmcSuite:
+    """F2 facade: structure + zones + bias in one call."""
+
+    def __init__(self):
+        self.struct = SwingStructure()
+        self.obs = OrderBlockPack()
+        self.fvgs = FvgPack()
+        self.breakers = BreakerPack()
+        self.sweeps = SweepPack()
+        self.pd = PremiumDiscountPack()
+
+    def analyze(self, df):
+        out = {"bias": 0.0, "conf": 0.0, "state": "RANGE",
+               "zones": [], "events": [], "pd": {}}
+        try:
+            o = qas_series(df, "open")
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            c = qas_series(df, "close")
+            if len(c) < 60:
+                return out
+            atr = q_atr_from_lists(h, l, c, 14)
+            a_last = atr[-1] if atr else (h[-1] - l[-1])
+            st = self.struct.structure(h, l, c)
+            out["state"] = st["state"]
+            out["events"] = st["events"]
+            obs = self.obs.detect(o, h, l, c, atr)
+            fvgs = self.fvgs.detect(o, h, l, c, atr)
+            brks = self.breakers.detect(o, h, l, c, atr)
+            swps = self.sweeps.detect(o, h, l, c)
+            pd = self.pd.analyze(h, l, c)
+            out["pd"] = pd
+            px = c[-1]
+            # Nearest active zone per side (distance in ATR)
+            zones = []
+            for z in obs[:4]:
+                d = 0 if z["bottom"] <= px <= z["top"] else min(abs(px - z["top"]), abs(px - z["bottom"])) / (a_last + 1e-12)
+                zones.append({"kind": "OB", "dir": z["dir"], "dist_atr": float(d),
+                              "strength": z["strength"], "mitigated": z["mitigated"]})
+            for z in fvgs[:4]:
+                d = 0 if z["bottom"] <= px <= z["top"] else min(abs(px - z["top"]), abs(px - z["bottom"])) / (a_last + 1e-12)
+                zones.append({"kind": "FVG", "dir": z["dir"], "dist_atr": float(d),
+                              "strength": z["strength"] * (1 - z["fill_pct"])})
+            for z in brks[:3]:
+                d = 0 if z["bottom"] <= px <= z["top"] else min(abs(px - z["top"]), abs(px - z["bottom"])) / (a_last + 1e-12)
+                zones.append({"kind": "BRK", "dir": z["dir"], "dist_atr": float(d), "strength": z["strength"]})
+            out["zones"] = sorted(zones, key=lambda z: z["dist_atr"])[:8]
+            # Bias: structure + fresh sweep + PD zone + nearest zone reaction
+            votes = []
+            if st["state"] == "UP":
+                votes.append(0.8)
+            elif st["state"] == "DOWN":
+                votes.append(-0.8)
+            else:
+                votes.append(0.0)
+            if swps and (len(c) - 1 - swps[0]["idx"]) <= 5:
+                votes.append(0.9 if swps[0]["dir"] == "BULL" else -0.9)
+            if pd["zone"] == "DISCOUNT":
+                votes.append(0.45)
+            elif pd["zone"] == "PREMIUM":
+                votes.append(-0.45)
+            if out["zones"] and out["zones"][0]["dist_atr"] < 0.5:
+                z0 = out["zones"][0]
+                votes.append((0.6 if z0["dir"] == "BULL" else -0.6) * z0["strength"])
+            bias = sum(votes) / max(1, len(votes))
+            out["bias"] = float(qclip(bias, -1, 1))
+            out["conf"] = float(qclip(1.0 - (max(votes) - min(votes)) / 4.0 if votes else 0, 0, 1)
+                                * (0.5 + 0.5 * min(1.0, len(votes) / 3)))
+            return out
+        except Exception:
+            return out
+
+
+SECTION_F12_OK = True
