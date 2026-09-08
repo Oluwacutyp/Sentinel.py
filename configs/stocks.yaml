@@ -1,0 +1,75 @@
+# Sentinel.py — stocks preset (session-aware, conservative costs)
+engine:
+  equity: 100000.0
+  base_currency: USD
+  base_risk: 0.006
+  max_positions: 10
+  max_leverage: 1.0
+  timeframe: 1D
+  higher_timeframes: [1W]
+  seed: 21
+
+regime:
+  lookback: 150
+  trend_adx_like: 0.28
+  squeeze_quantile: 0.18
+  panic_vol_quantile: 0.94
+  min_bars: 120
+
+adaptive:
+  enabled: true
+  vol_window: 40
+  scale_min: 0.6
+  scale_max: 2.0
+  recalibrate_bars: 600
+
+signals:
+  min_agreement: 0.60
+  hysteresis: 0.06
+  pattern_boost: 0.08
+  pattern_veto: 0.90
+
+ml:
+  enabled: true
+  threshold: 0.55
+  retrain_bars: 2500
+  embargo_bars: 10
+  max_features: 48
+
+risk:
+  sizing: fixed
+  kelly_cap: 0.15
+  vol_target: 0.10
+  cppi_floor: 0.90
+  cppi_multiple: 2.0
+  stop_atr: 3.0
+  time_stop_bars: 60
+  breakeven_atr: 1.5
+  daily_halt: -0.02
+  max_drawdown: -0.12
+  max_correlation: 0.65
+  exposure_cap: 0.90
+
+costs:
+  fee_bps: 1
+  slippage_atr: 0.03
+  spread_bps: 3
+  funding_8h_bps: 0
+  latency_ms: 1000
+
+sessions:
+  exchange: NYSE
+  open: "09:30"
+  close: "16:00"
+  timezone: America/New_York
+
+backtest:
+  engine: event_driven
+  warmup_bars: 250
+  cash: 100000.0
+
+live:
+  dry_run: true
+  poll_seconds: 300
+  error_budget: 5
+  panic_file: /tmp/sentinel_panic

@@ -1,0 +1,31 @@
+# Sentinel.py — aggressive preset (higher risk, faster triggers, more names)
+engine:
+  equity: 50000.0
+  base_currency: USD
+  base_risk: 0.02
+  max_positions: 10
+  max_leverage: 3.0
+  timeframe: 15m
+  higher_timeframes: [1h, 4h]
+  seed: 99
+
+regime: { lookback: 150, squeeze_quantile: 0.10, panic_vol_quantile: 0.97 }
+adaptive: { enabled: true, vol_window: 40, scale_min: 0.4, scale_max: 2.5, recalibrate_bars: 300 }
+signals: { min_agreement: 0.50, hysteresis: 0.12, pattern_boost: 0.15, pattern_veto: 0.80 }
+ml: { enabled: true, threshold: 0.52, retrain_bars: 1200, embargo_bars: 12, max_features: 64 }
+
+risk:
+  sizing: kelly_frac
+  kelly_cap: 0.35
+  vol_target: 0.30
+  stop_atr: 1.8
+  time_stop_bars: 60
+  breakeven_atr: 0.8
+  daily_halt: -0.06
+  max_drawdown: -0.25
+  max_correlation: 0.85
+  exposure_cap: 2.50
+
+costs: { fee_bps: 5, slippage_atr: 0.08, spread_bps: 3, funding_8h_bps: 1, latency_ms: 400 }
+backtest: { engine: event_driven, warmup_bars: 400, cash: 50000.0 }
+live: { dry_run: true, poll_seconds: 20, error_budget: 8, panic_file: /tmp/sentinel_panic }
