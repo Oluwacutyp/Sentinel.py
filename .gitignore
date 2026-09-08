@@ -17,3 +17,7 @@ reports/
 checkpoints/
 *.parquet
 *.csv.gz
+.env
+state/
+*.db
+*.db-journal
