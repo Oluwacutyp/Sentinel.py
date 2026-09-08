@@ -25217,7 +25217,13 @@ class EarlyAnalysisGate:
                     spr = None
             if spr is not None:
                 self.observe_tick(spread=spr)
-                pct = self.spread.percentile(spr)
+                # Thin-history neutrality: <30 prints => no opinion (0.5),
+                # else a fresh install would veto every cycle as 'extreme'.
+                try:
+                    _depth = len(self.spread.window)
+                except Exception:
+                    _depth = 0
+                pct = self.spread.percentile(spr) if _depth >= 30 else 0.5
             else:
                 pct = 0.5
             verdict["spread_pctile"] = float(pct)
@@ -27553,3 +27559,1557 @@ class SmcSuite:
 
 
 SECTION_F12_OK = True
+
+# ============================================================================
+# F3 — FIELD SUITE (VWAP, gravity fields, dark pools, radar, patterns)
+# ----------------------------------------------------------------------------
+# The OMNI-GOD "quantum" visuals become measurable evidence:
+# VWAP bands, Quantum Field Gravity, Dark Pool absorption, liquidity heat,
+# multi-detector Confluence Radar, HTF Ichimoku context, H&S detection,
+# session boxes. Facade: pine_confluence(df) -> bias/conf/zones/reasons.
+# ============================================================================
+
+class VwapPack:
+    """Rolling VWAP + adaptive bands (tick-volume weighted; time fallback)."""
+
+    @staticmethod
+    def _vols(df):
+        for col in ("tick_volume", "volume", "real_volume"):
+            v = qas_series(df, col)
+            if v and any(x > 0 for x in v):
+                return v
+        c = qas_series(df, "close")
+        return [1.0] * len(c)
+
+    def analyze(self, df, window=96):
+        res = {"vwap": 0.0, "upper": 0.0, "lower": 0.0, "pos": 0.5,
+               "dist_sd": 0.0, "trend": 0.0}
+        try:
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            c = qas_series(df, "close")
+            v = self._vols(df)
+            n = min(len(h), len(l), len(c), len(v))
+            if n < 20:
+                return res
+            tp = [((h[i] + l[i] + c[i]) / 3.0) for i in range(n)]
+            win = max(20, min(window, n))
+            tpw, vw = tp[-win:], v[-win:]
+            vwap = sum(t * x for t, x in zip(tpw, vw)) / (sum(vw) + 1e-12)
+            var = sum(x * (t - vwap) ** 2 for t, x in zip(tpw, vw)) / (sum(vw) + 1e-12)
+            sd = var ** 0.5
+            # Adaptive band width: wider when realized vol is high vs own past
+            rets = [(c[i] / c[i - 1] - 1) for i in range(max(1, n - win), n) if c[i - 1]]
+            import statistics as _st
+            rv = _st.pstdev(rets) if len(rets) > 5 else sd / (abs(vwap) + 1e-12)
+            mult = qclip(1.2 + rv * 60.0, 1.0, 3.0)
+            dist = (c[-1] - vwap) / (sd + 1e-12)
+            res.update({"vwap": float(vwap), "upper": float(vwap + mult * sd),
+                        "lower": float(vwap - mult * sd),
+                        "pos": float(qclip(0.5 + dist / (2 * mult), 0, 1)),
+                        "dist_sd": float(qclip(dist, -4, 4)),
+                        "trend": float(qsign(c[-1] - vwap) * qclip(abs(dist) / 2, 0, 1))})
+            return res
+        except Exception:
+            return res
+
+
+class QuantumFieldGravity:
+    """Potential-field S/R: swing/volume/time nodes attract like gravity.
+
+    Each historical swing + high-volume bar is a mass; gravity at price p is
+    sum(mass / (1 + dist^2)). Local maxima = magnets. Fully deterministic.
+    """
+
+    def __init__(self, lookback=300, nodes=40, grid=120):
+        self.lookback = int(lookback)
+        self.nodes = int(nodes)
+        self.grid = int(grid)
+
+    def _masses(self, h, l, c, v):
+        masses = []
+        try:
+            n = len(c)
+            lo = max(0, n - self.lookback)
+            # Swing masses
+            sw = SwingStructure()
+            his, los = sw.swings(h[lo:], l[lo:], limit=self.nodes)
+            for _, px in his:
+                masses.append((float(px), 2.0))
+            for _, px in los:
+                masses.append((float(px), 2.0))
+            # Volume masses: top-volume bars' typical price
+            if v and len(v) == n:
+                seg = [(v[i], (h[i] + l[i] + c[i]) / 3) for i in range(lo, n)]
+                seg.sort(reverse=True)
+                for vol, px in seg[:self.nodes // 2]:
+                    masses.append((float(px), 1.0 + min(2.0, vol / (sum(v[lo:]) / max(1, n - lo) + 1e-9))))
+            # Recency-weighted close mass (tape memory)
+            for k in range(min(20, n - lo)):
+                w = 1.5 * (1 - k / 20.0)
+                masses.append((float(c[n - 1 - k]), w))
+        except Exception:
+            pass
+        return masses
+
+    def field(self, h, l, c, v=None):
+        """Returns {levels:[{price, pull}], bias, nearest:{...}}}."""
+        res = {"levels": [], "bias": 0.0, "nearest": {}}
+        try:
+            n = len(c)
+            if n < 60:
+                return res
+            v = v or [1.0] * n
+            masses = self._masses(h, l, c, v)
+            if not masses:
+                return res
+            lo = max(0, n - self.lookback)
+            gmin, gmax = min(l[lo:]), max(h[lo:])
+            if gmax - gmin <= 1e-12:
+                return res
+            step = (gmax - gmin) / self.grid
+            pulls = []
+            for g in range(self.grid + 1):
+                p = gmin + g * step
+                pull = 0.0
+                for px, m in masses:
+                    d = abs(p - px) / (step * 4 + 1e-12)
+                    pull += m / (1 + d * d)
+                pulls.append((p, pull))
+            # Local maxima = gravity levels
+            levels = []
+            for g in range(2, len(pulls) - 2):
+                if pulls[g][1] >= pulls[g - 1][1] and pulls[g][1] >= pulls[g + 1][1] \
+                   and pulls[g][1] >= pulls[g - 2][1] and pulls[g][1] >= pulls[g + 2][1]:
+                    levels.append({"price": float(pulls[g][0]), "pull": float(pulls[g][1])})
+            levels.sort(key=lambda z: -z["pull"])
+            levels = levels[:6]
+            mx = max([z["pull"] for z in levels] or [1.0])
+            for z in levels:
+                z["pull"] = float(z["pull"] / (mx + 1e-12))
+            res["levels"] = levels
+            px = c[-1]
+            if levels:
+                near = min(levels, key=lambda z: abs(z["price"] - px))
+                rng = (gmax - gmin) + 1e-12
+                res["nearest"] = {"price": near["price"], "pull": near["pull"],
+                                  "dist_pct": float(abs(near["price"] - px) / rng),
+                                  "side": "above" if near["price"] > px else "below"}
+                # Bias: net pull direction weighted by proximity
+                up = sum(z["pull"] / (1 + abs(z["price"] - px) / (rng * 0.05)) for z in levels if z["price"] > px)
+                dn = sum(z["pull"] / (1 + abs(z["price"] - px) / (rng * 0.05)) for z in levels if z["price"] <= px)
+                res["bias"] = float(qclip((up - dn) / (up + dn + 1e-12), -1, 1) * -1.0)
+            return res
+        except Exception:
+            return res
+
+
+class DarkPoolPack:
+    """Hidden absorption proxy: low-range + high-volume + close-mid bars.
+
+    Institutions hide in bars that SHOULD move but don't. Clusters of such
+    bars mark defended levels. Strength from persistence + volume anomaly.
+    """
+
+    def detect(self, df, lookback=200, top=5):
+        res = {"levels": [], "bias": 0.0}
+        try:
+            o = qas_series(df, "open")
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            c = qas_series(df, "close")
+            v = VwapPack._vols(df)
+            n = min(len(o), len(h), len(l), len(c), len(v))
+            if n < 60:
+                return res
+            lo = max(0, n - lookback)
+            rngs = [(h[i] - l[i]) for i in range(lo, n)]
+            import statistics as _st
+            med_rng = _st.median(rngs) if rngs else 1e-9
+            med_vol = _st.median(v[lo:n]) if v[lo:n] else 1.0
+            cands = []
+            for i in range(lo, n):
+                rng = h[i] - l[i]
+                if rng <= 1e-12:
+                    continue
+                body_pos = abs(c[i] - (h[i] + l[i]) / 2) / rng  # 0 = mid (absorption)
+                vol_z = v[i] / (med_vol + 1e-12)
+                rng_z = rng / (med_rng + 1e-12)
+                if vol_z >= 1.6 and rng_z <= 0.7 and body_pos <= 0.25:
+                    score = vol_z / (rng_z + 0.2) * (1 - body_pos)
+                    cands.append({"price": float((h[i] + l[i]) / 2), "idx": i,
+                                  "score": float(score)})
+            # Cluster nearby candidates (within 0.15 ATR)
+            atr = q_atr_from_lists(h, l, c, 14)
+            a = atr[-1] if atr else med_rng
+            clusters = []
+            for cd in sorted(cands, key=lambda z: z["price"]):
+                placed = False
+                for cl in clusters:
+                    if abs(cl["price"] - cd["price"]) <= 0.15 * a:
+                        cl["score"] += cd["score"]
+                        cl["hits"] += 1
+                        cl["price"] = (cl["price"] * (cl["hits"] - 1) + cd["price"]) / cl["hits"]
+                        placed = True
+                        break
+                if not placed:
+                    clusters.append({"price": cd["price"], "score": cd["score"], "hits": 1})
+            clusters.sort(key=lambda z: -z["score"])
+            mx = max([z["score"] for z in clusters] or [1.0])
+            for z in clusters[:top]:
+                z["score"] = float(z["score"] / (mx + 1e-12))
+            res["levels"] = clusters[:top]
+            # Bias: defended below => bullish; defended above => bearish
+            px = c[-1]
+            bull = sum(z["score"] for z in res["levels"] if z["price"] < px)
+            bear = sum(z["score"] for z in res["levels"] if z["price"] >= px)
+            res["bias"] = float(qclip((bull - bear) / (bull + bear + 1e-12), -1, 1))
+            return res
+        except Exception:
+            return res
+
+
+class HeatProjection:
+    """Liquidity heat: where would stops cluster? (swing-majority projection)."""
+
+    def project(self, h, l, c, horizon=50):
+        res = {"hot_above": 0.0, "hot_below": 0.0, "magnet": 0.0, "heat": 0.0}
+        try:
+            n = len(c)
+            if n < 60:
+                return res
+            sw = SwingStructure()
+            his, los = sw.swings(h, l, limit=12)
+            px = c[-1]
+            atr = q_atr_from_lists(h, l, c, 14)
+            a = atr[-1] if atr else (max(h[-50:]) - min(l[-50:])) / 10.0 + 1e-9
+            above = [p for _, p in his if p > px]
+            below = [p for _, p in los if p < px]
+            # Density-weighted heat within 3 ATR
+            ha = sum(1.0 / (1 + (p - px) / a) for p in above if (p - px) / a <= 3)
+            hb = sum(1.0 / (1 + (px - p) / a) for p in below if (px - p) / a <= 3)
+            res["hot_above"] = float(ha)
+            res["hot_below"] = float(hb)
+            res["magnet"] = float(qclip((ha - hb) / (ha + hb + 1e-12), -1, 1))
+            res["heat"] = float(qclip((ha + hb) / 6.0, 0, 1))
+            return res
+        except Exception:
+            return res
+
+
+class IchimokuHtf:
+    """HTF Ichimoku context: cloud position + twist + lagging alignment."""
+
+    @staticmethod
+    def _mid(h, l, n):
+        out = []
+        for i in range(len(h)):
+            lo = max(0, i - n + 1)
+            out.append((max(h[lo:i + 1]) + min(l[lo:i + 1])) / 2)
+        return out
+
+    def analyze(self, df):
+        res = {"bias": 0.0, "conf": 0.0, "above_cloud": False, "cloud_green": False}
+        try:
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            c = qas_series(df, "close")
+            n = len(c)
+            if n < 60:
+                return res
+            tenkan = self._mid(h, l, 9)
+            kijun = self._mid(h, l, 26)
+            sa = [(tenkan[i] + kijun[i]) / 2 for i in range(n)]
+            sb = self._mid(h, l, 52)
+            i = n - 1
+            up = c[i] > max(sa[i], sb[i])
+            dn = c[i] < min(sa[i], sb[i])
+            green = sa[i] >= sb[i]
+            lag_ok = (c[i] > c[i - 26]) if i >= 26 else True
+            tk_up = tenkan[i] > kijun[i]
+            score = (1 if up else (-1 if dn else 0)) + (0.5 if green else -0.5) \
+                + (0.5 if tk_up else -0.5) + (0.25 if lag_ok else -0.25)
+            res.update({"bias": float(qclip(score / 2.25, -1, 1)),
+                        "conf": float(0.5 + 0.25 * abs(score)),
+                        "above_cloud": bool(up), "cloud_green": bool(green)})
+            return res
+        except Exception:
+            return res
+
+
+class HeadShouldersPack:
+    """Head & Shoulders / inverse: swing-symmetric 5-pivot detector."""
+
+    def detect(self, h, l, c):
+        res = {"pattern": None, "conf": 0.0, "neck": 0.0, "target": 0.0}
+        try:
+            sw = SwingStructure(width=4)
+            his, los = sw.swings(h, l, limit=12)
+            if len(his) >= 3:
+                p3 = sorted(his[:5], key=lambda t: t[0])[-3:]
+                (i1, a), (i2, hd), (i3, b) = p3
+                if hd > a and hd > b and abs(a - b) / (hd + 1e-12) < 0.15:
+                    # Neckline from intervening lows
+                    mids = [p for j, p in los if i1 < j < i3]
+                    if mids:
+                        neck = sum(mids) / len(mids)
+                        broke = c[-1] < neck
+                        res.update({"pattern": "HS_BEAR", "neck": float(neck),
+                                    "target": float(neck - (hd - neck)),
+                                    "conf": float(0.55 + (0.25 if broke else 0))})
+                        return res
+            if len(los) >= 3:
+                p3 = sorted(los[:5], key=lambda t: t[0])[-3:]
+                (i1, a), (i2, hd), (i3, b) = p3
+                if hd < a and hd < b and abs(a - b) / (abs(hd) + 1e-12) < 0.15:
+                    mids = [p for j, p in his if i1 < j < i3]
+                    if mids:
+                        neck = sum(mids) / len(mids)
+                        broke = c[-1] > neck
+                        res.update({"pattern": "HS_BULL", "neck": float(neck),
+                                    "target": float(neck + (neck - hd)),
+                                    "conf": float(0.55 + (0.25 if broke else 0))})
+            return res
+        except Exception:
+            return res
+
+
+class SessionBoxPack:
+    """Asian range box + session high/low tracker (UTC sessions)."""
+
+    @staticmethod
+    def _session_bars(df, sess):
+        try:
+            idx = getattr(df, "index", None)
+            if idx is None:
+                return None
+            import pandas as _pd
+            hours = _pd.DatetimeIndex(idx).hour
+            if sess == "ASIA":
+                mask = (hours >= 0) & (hours < 7)
+            elif sess == "LONDON":
+                mask = (hours >= 7) & (hours < 12)
+            elif sess == "OVERLAP":
+                mask = (hours >= 12) & (hours < 16)
+            elif sess == "NEWYORK":
+                mask = (hours >= 16) & (hours < 21)
+            else:
+                return None
+            return df[mask]
+        except Exception:
+            return None
+
+    def boxes(self, df):
+        out = {}
+        try:
+            for s in ("ASIA", "LONDON", "OVERLAP", "NEWYORK"):
+                sub = self._session_bars(df, s)
+                if sub is not None and len(sub) >= 5:
+                    out[s] = {"high": float(sub["high"].iloc[-60:].max()),
+                              "low": float(sub["low"].iloc[-60:].min()),
+                              "n": int(min(60, len(sub)))}
+            c = qas_series(df, "close")
+            px = c[-1] if c else 0
+            ab = out.get("ASIA")
+            if ab and px:
+                rng = ab["high"] - ab["low"] + 1e-12
+                if px > ab["high"]:
+                    out["ASIA_BREAK"] = "UP"
+                elif px < ab["low"]:
+                    out["ASIA_BREAK"] = "DOWN"
+                else:
+                    out["ASIA_BREAK"] = "INSIDE"
+                out["ASIA_POS"] = float(qclip((px - ab["low"]) / rng, 0, 1))
+            return out
+        except Exception:
+            return out
+
+
+class ConfluenceRadar:
+    """Fuses F1+F2+F3 (+SMC/volume) into ONE bias/conf + ranked reasons.
+
+    Output: {bias(-1..1), conf(0..1), votes[{src, bias, w}], zones, reasons}
+    This is the pine 'Confluence Heatmap' as a tradeable number.
+    """
+
+    def __init__(self):
+        self.trend = TrendCorePack()
+        self.smc = SmcSuite()
+        self.vwap = VwapPack()
+        self.qfg = QuantumFieldGravity()
+        self.dark = DarkPoolPack()
+        self.heat = HeatProjection()
+        self.ichi = IchimokuHtf()
+        self.hs = HeadShouldersPack()
+        self.sess = SessionBoxPack()
+
+    def scan(self, df, htf_df=None):
+        out = {"bias": 0.0, "conf": 0.0, "votes": [], "zones": [],
+               "reasons": [], "detail": {}}
+        try:
+            c = qas_series(df, "close")
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            if len(c) < 80:
+                out["reasons"].append("insufficient bars")
+                return out
+            votes = []
+            # 1. Trend core (weight by its confidence)
+            t = self.trend.analyze(df)
+            votes.append(("trend", t["bias"], 0.5 + t["conf"]))
+            # 2. SMC suite
+            s = self.smc.analyze(df)
+            votes.append(("smc", s["bias"], 0.5 + s["conf"]))
+            out["zones"] = s.get("zones", [])[:6]
+            # 3. VWAP position
+            v = self.vwap.analyze(df)
+            votes.append(("vwap", float(qclip(v["trend"], -1, 1)), 0.7))
+            # 4. Gravity field (mean-reversion pull => fade the pull slightly)
+            g = self.qfg.field(h, l, c)
+            votes.append(("qfg", -g["bias"] * 0.5, 0.5))
+            for z in g.get("levels", [])[:3]:
+                out["zones"].append({"kind": "QFG", "dir": "MAG",
+                                      "price": z["price"], "strength": z["pull"]})
+            # 5. Dark pools (defense => with-defense bias)
+            d = self.dark.detect(df)
+            votes.append(("darkpool", d["bias"], 0.6))
+            # 6. Heat magnet (fade extreme heat: liquidity grabs reverse)
+            hp = self.heat.project(h, l, c)
+            votes.append(("heat", -hp["magnet"] * hp["heat"], 0.4 + 0.4 * hp["heat"]))
+            # 7. HTF ichimoku context
+            if htf_df is not None:
+                im = self.ichi.analyze(htf_df)
+                votes.append(("ichimoku_htf", im["bias"], 0.5 + im["conf"]))
+                out["detail"]["ichimoku"] = im
+            # 8. H&S completion
+            pat = self.hs.detect(h, l, c)
+            if pat["pattern"]:
+                votes.append(("hs", 0.8 if "BULL" in pat["pattern"] else -0.8, pat["conf"]))
+                out["detail"]["hs"] = pat
+            # 9. Session box (asia break continuation, small vote)
+            boxes = self.sess.boxes(df)
+            if boxes.get("ASIA_BREAK") == "UP":
+                votes.append(("asia_box", 0.4, 0.5))
+            elif boxes.get("ASIA_BREAK") == "DOWN":
+                votes.append(("asia_box", -0.4, 0.5))
+            out["detail"]["boxes"] = {k: v for k, v in boxes.items() if not isinstance(v, dict)}
+            # Fuse: confidence-weighted mean + agreement-scaled confidence
+            tot = sum(w for _, _, w in votes) or 1.0
+            bias = sum(b * w for _, b, w in votes) / tot
+            bs = [b for _, b, _ in votes]
+            agree = 1.0 - (max(bs) - min(bs)) / 4.0 if bs else 0
+            conf = qclip(agree * (0.4 + 0.6 * min(1.0, tot / 5.0)), 0, 1)
+            out.update({"bias": float(qclip(bias, -1, 1)), "conf": float(conf),
+                        "votes": [{"src": s, "bias": round(float(b), 3), "w": round(float(w), 3)}
+                                  for s, b, w in votes]})
+            ranked = sorted(votes, key=lambda t: -abs(t[1]) * t[2])[:4]
+            out["reasons"] = [f"{s}:{b:+.2f}x{w:.2f}" for s, b, w in ranked]
+            out["detail"]["trend"] = {"bias": t["bias"], "conf": t["conf"]}
+            out["detail"]["smc_state"] = s.get("state")
+            return out
+        except Exception as e:
+            out["reasons"].append(f"radar error: {e}")
+            return out
+
+
+_RADAR_SINGLETON = {"obj": None}
+
+
+def pine_confluence(df, htf_df=None):
+    """ONE-call facade: full pine-parity scan -> bias/conf/zones/reasons."""
+    try:
+        r = _RADAR_SINGLETON.get("obj")
+        if r is None:
+            r = ConfluenceRadar()
+            _RADAR_SINGLETON["obj"] = r
+        return r.scan(df, htf_df)
+    except Exception as e:
+        return {"bias": 0.0, "conf": 0.0, "votes": [], "zones": [],
+                "reasons": [f"facade error: {e}"], "detail": {}}
+
+
+SECTION_F3_OK = True
+
+# ============================================================================
+# PHASE G — WALK-FORWARD LAB (prove the new brain before it risks a cent)
+# ----------------------------------------------------------------------------
+# Nothing here tunes in-sample. The lab validates the QUANTUM selector with:
+#  * anchored walk-forward over the bot's own labeled signal history
+#    (train ridge-logistic in-sample, score out-of-sample, embargo gaps)
+#  * Deflated Sharpe (multiple-testing haircut for every trial we ran)
+#  * Monte-Carlo trade reshuffle (ruin odds, DD bands from the R tape)
+#  * Gate A/B card: v12 fixed-gate vs quantum gate on the SAME history
+# Verdicts: ROBUST / WEAK / HARMFUL with numbers, never vibes.
+# ============================================================================
+
+class RMath:
+    """Expectancy math on R-multiple tapes. Pure python."""
+
+    @staticmethod
+    def clean(rs):
+        out = []
+        for r in rs or []:
+            try:
+                r = float(r)
+                if r == r and abs(r) != float("inf"):
+                    out.append(max(-10.0, min(10.0, r)))
+            except Exception:
+                pass
+        return out
+
+    @staticmethod
+    def expectancy(rs):
+        rs = RMath.clean(rs)
+        return sum(rs) / max(1, len(rs)) if rs else 0.0
+
+    @staticmethod
+    def win_rate(rs):
+        rs = RMath.clean(rs)
+        return sum(1 for r in rs if r > 0) / max(1, len(rs)) if rs else 0.0
+
+    @staticmethod
+    def profit_factor(rs):
+        rs = RMath.clean(rs)
+        g = sum(r for r in rs if r > 0)
+        l = -sum(r for r in rs if r < 0)
+        if l <= 1e-12:
+            return 99.0 if g > 0 else 0.0
+        return g / l
+
+    @staticmethod
+    def sharpe_r(rs, per_year=500):
+        rs = RMath.clean(rs)
+        if len(rs) < 5:
+            return 0.0
+        import math as _m
+        m = sum(rs) / len(rs)
+        var = sum((r - m) ** 2 for r in rs) / (len(rs) - 1)
+        if var <= 1e-12:
+            return 0.0
+        return (m / (var ** 0.5)) * (per_year ** 0.5)
+
+    @staticmethod
+    def max_dd_r(rs):
+        rs = RMath.clean(rs)
+        peak, mx, dd = 0.0, 0.0, 0.0
+        for r in rs:
+            peak += r
+            mx = max(mx, peak)
+            dd = min(dd, peak - mx)
+        return float(dd)
+
+    @staticmethod
+    def skew_kurt(rs):
+        rs = RMath.clean(rs)
+        if len(rs) < 8:
+            return (0.0, 3.0)
+        import math as _m
+        m = sum(rs) / len(rs)
+        var = sum((r - m) ** 2 for r in rs) / len(rs)
+        if var <= 1e-12:
+            return (0.0, 3.0)
+        sd = var ** 0.5
+        sk = sum(((r - m) / sd) ** 3 for r in rs) / len(rs)
+        ku = sum(((r - m) / sd) ** 4 for r in rs) / len(rs)
+        return (float(sk), float(ku))
+
+    @staticmethod
+    def summary(rs, label=""):
+        rs = RMath.clean(rs)
+        sk, ku = RMath.skew_kurt(rs)
+        return {"label": label, "n": len(rs),
+                "exp_r": round(RMath.expectancy(rs), 4),
+                "win_rate": round(RMath.win_rate(rs), 4),
+                "pf": round(RMath.profit_factor(rs), 3),
+                "sharpe": round(RMath.sharpe_r(rs), 3),
+                "max_dd_r": round(RMath.max_dd_r(rs), 2),
+                "skew": round(sk, 3), "kurt": round(ku, 3)}
+
+
+def deflated_sharpe(rs, trials=1, benchmark=0.0):
+    """Bailey & Lopez de Prado Deflated Sharpe Ratio (documented approx).
+
+    H0: true Sharpe == benchmark. Returns {dsr, prob_skill, expected_max}.
+    """
+    out = {"dsr": 0.0, "prob_skill": 0.5, "expected_max": 0.0, "sr": 0.0}
+    try:
+        rs = RMath.clean(rs)
+        t = len(rs)
+        if t < 10:
+            return out
+        import math as _m
+        sr = RMath.sharpe_r(rs, per_year=1)
+        sk, ku = RMath.skew_kurt(rs)
+        out["sr"] = float(sr)
+        var_sr = (1 + 0.5 * (sr - benchmark) ** 2 - sk * (sr - benchmark)
+                  + ((ku - 3) / 4) * (sr - benchmark) ** 2) / max(1, t - 1)
+        var_sr = max(var_sr, 1e-12)
+        k = max(1, int(trials))
+        euler = 0.5772156649
+        if k == 1:
+            exp_max = benchmark
+        else:
+            exp_max = benchmark + (var_sr ** 0.5) * ((1 - euler) * (_m.log(k) ** 0 + 1) * 0 + 1) * 0
+            # standard SRM expected-max under independence:
+            exp_max = benchmark + (var_sr ** 0.5) * ((1 - euler) * 1.0 + euler * (2 * _m.log(k)) ** 0.5)
+        out["expected_max"] = float(exp_max)
+        dsr = (sr - exp_max) / (var_sr ** 0.5)
+        out["dsr"] = float(dsr)
+        out["prob_skill"] = float(qclip(0.5 * (1 + _m.erf(dsr / (_m.sqrt(2)))), 0, 1))
+        return out
+    except Exception:
+        return out
+
+
+class MonteCarloTape:
+    """Bootstrap the R tape: ruin odds, DD distribution, equity bands."""
+
+    @staticmethod
+    def run(rs, sims=2000, risk_per_trade=0.01, ruin_dd=0.20, seed=7):
+        res = {"sims": sims, "ruin_prob": 0.0, "median_dd": 0.0,
+               "dd_p90": 0.0, "median_end": 0.0, "end_p10": 0.0}
+        try:
+            rs = RMath.clean(rs)
+            if len(rs) < 10:
+                return res
+            import random as _r
+            rng = _r.Random(seed)
+            ruins = 0
+            ends, dds = [], []
+            for _ in range(max(100, sims)):
+                eq, peak, dd = 1.0, 1.0, 0.0
+                for _ in range(len(rs)):
+                    r = rng.choice(rs)
+                    eq *= (1 + risk_per_trade * r)
+                    eq = max(eq, 1e-9)
+                    peak = max(peak, eq)
+                    dd = min(dd, (eq - peak) / peak)
+                ends.append(eq - 1)
+                dds.append(dd)
+                if dd <= -abs(ruin_dd):
+                    ruins += 1
+            ends.sort()
+            dds.sort()
+            res.update({"ruin_prob": round(ruins / max(1, sims), 4),
+                        "median_dd": round(dds[len(dds) // 2], 4),
+                        "dd_p90": round(dds[int(len(dds) * 0.10)], 4),
+                        "median_end": round(ends[len(ends) // 2], 4),
+                        "end_p10": round(ends[int(len(ends) * 0.10)], 4)})
+            return res
+        except Exception:
+            return res
+
+
+class WalkForwardLab:
+    """Anchored walk-forward for the CALIBRATION selector.
+
+    Uses (features, win_label, R) rows in chronological order:
+      fold f: train on [0, tr_end), embargo, test on [te_start, te_end).
+    Compares quantum-prob gate vs v12-score gate OOS. No peeking: the
+    calibrator inside each fold fits ONLY on in-sample rows.
+    """
+
+    def __init__(self, symbol=None, folds=None, embargo=None):
+        self.symbol = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        self.folds = int(folds or _qcfg("quantum_wf_folds", 4))
+        self.embargo = int(embargo if embargo is not None else _qcfg("quantum_wf_embargo_bars", 20))
+
+    def _rows(self, limit=6000):
+        """Chronological (features, win, R, score, pnl) rows, oldest first."""
+        rows = []
+        try:
+            st = _qstore()
+            if st is None:
+                return rows
+            conn = getattr(st, "conn", None)
+            if conn is None:
+                return rows
+            q = ("SELECT r.raw_features, r.base_score, r.tf, r.dir, "
+                 "s.score, t.pnl, t.r_mult, t.strategy "
+                 "FROM trades t JOIN signals s ON s.id = t.signal_id "
+                 "JOIN raw_signals r ON r.id = s.raw_signal_id "
+                 "WHERE t.pnl IS NOT NULL ORDER BY t.rowid ASC LIMIT ?")
+            cal = get_calibrated_scorer(self.symbol)
+            for row in conn.execute(q, (int(limit),)).fetchall():
+                try:
+                    raw, bs, tf, dd, sc, pnl, rr, strat = row
+                    d = {"features": raw, "base_score": bs, "tf": tf, "dir": dd, "strategy": strat}
+                    fv = CalibratedScoringEngine._row_features(d) if cal else None
+                    if fv is None:
+                        continue
+                    win = 1.0 if float(pnl or 0) > 0 else 0.0
+                    r = float(rr) if rr is not None else (0.5 if win else -1.0)
+                    rows.append({"x": fv, "win": win, "r": r,
+                                 "score": float(sc if sc is not None else (bs or 0)),
+                                 "pnl": float(pnl or 0)})
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return rows
+
+    def run(self, min_score_gate=None, p_gate=None, limit=6000):
+        """Returns full A/B report: v12 gate vs quantum gate, per fold + pooled."""
+        rep = {"symbol": self.symbol, "folds": [], "verdict": "NO_DATA",
+               "v12": {}, "quantum": {}, "n": 0}
+        try:
+            rows = self._rows(limit)
+            rep["n"] = len(rows)
+            if len(rows) < 120:
+                rep["verdict"] = f"NO_DATA ({len(rows)} rows)"
+                return rep
+            ms_gate = float(min_score_gate if min_score_gate is not None else _qcfg("min_score", 7.0))
+            pg = float(p_gate if p_gate is not None else _qcfg("quantum_min_confidence", 0.55))
+            n = len(rows)
+            fold_n = n // (self.folds + 1)
+            pooled_v12, pooled_q = [], []
+            for f in range(self.folds):
+                tr_end = fold_n * (f + 1)
+                te_start = tr_end + self.embargo
+                te_end = min(n, fold_n * (f + 2))
+                if te_end - te_start < 25 or tr_end < 60:
+                    continue
+                tr = rows[:tr_end]
+                te = rows[te_start:te_end]
+                Xtr = [r["x"] for r in tr]
+                ytr = [r["win"] for r in tr]
+                prior_vec = [float(CAL_PRIORS.get(nm, 0.0)) for nm in SIGNAL_FEATURE_NAMES]
+                mdl = RidgeLogistic(l2=float(_qcfg("quantum_cal_l2", 1.0)),
+                                    prior=prior_vec,
+                                    prior_strength=float(_qcfg("quantum_prior_strength", 25.0)))
+                if not mdl.fit(Xtr, ytr):
+                    continue
+                raw_tr = mdl.predict_proba(Xtr)
+                cal = IsotonicLite(bins=int(_qcfg("quantum_cal_bins", 10)))
+                cal.fit(raw_tr, ytr)
+                # OOS decisions
+                r_v12, r_q = [], []
+                for r in te:
+                    if r["score"] >= ms_gate:
+                        r_v12.append(r["r"])
+                    pr = RidgeLogistic._sigmoid(mdl.decision(r["x"]))
+                    if cal.map(pr) >= pg:
+                        r_q.append(r["r"])
+                pooled_v12.extend(r_v12)
+                pooled_q.extend(r_q)
+                rep["folds"].append({
+                    "fold": f, "is_n": len(tr), "oos_n": len(te),
+                    "v12": RMath.summary(r_v12, f"v12_f{f}"),
+                    "quantum": RMath.summary(r_q, f"q_f{f}")})
+            rep["v12"] = RMath.summary(pooled_v12, "v12_pooled")
+            rep["quantum"] = RMath.summary(pooled_q, "quantum_pooled")
+            # Verdict logic (pooled OOS, conservative)
+            qe = rep["quantum"]["exp_r"]
+            ve = rep["v12"]["exp_r"]
+            qn = rep["quantum"]["n"]
+            if qn < 20:
+                rep["verdict"] = "WEAK (too few quantum trades OOS)"
+            elif qe > ve + 0.05 and qe > 0:
+                rep["verdict"] = "ROBUST (quantum beats v12 OOS)"
+            elif qe > 0 and qe >= ve:
+                rep["verdict"] = "USEFUL (quantum >= v12, positive)"
+            elif qe > ve:
+                rep["verdict"] = "MIXED (better but still <= 0)"
+            else:
+                rep["verdict"] = "HARMFUL (quantum underperforms v12 OOS)"
+            rep["dsr_v12"] = deflated_sharpe(pooled_v12, trials=1)
+            rep["dsr_quantum"] = deflated_sharpe(pooled_q, trials=3)
+            rep["mc_quantum"] = MonteCarloTape.run(pooled_q)
+            return rep
+        except Exception as e:
+            rep["verdict"] = f"ERROR: {e}"
+            return rep
+
+    def report_text(self, rep=None, **kw):
+        rep = rep or self.run(**kw)
+        try:
+            L = [f"🔬 WALK-FORWARD LAB — {rep.get('symbol')} (n={rep.get('n')})",
+                 f"Verdict: {rep.get('verdict')}"]
+            for tag in ("v12", "quantum"):
+                s = rep.get(tag, {})
+                L.append(f"{tag}: n={s.get('n')} exp={s.get('exp_r'):+.3f}R wr={s.get('win_rate'):.0%} "
+                         f"pf={s.get('pf')} dd={s.get('max_dd_r')}R")
+            d = rep.get("dsr_quantum", {})
+            L.append(f"Quantum DSR={d.get('dsr', 0):+.2f} P(skill)={d.get('prob_skill', 0):.0%}")
+            m = rep.get("mc_quantum", {})
+            L.append(f"MC: ruin={m.get('ruin_prob', 0):.1%} medDD={m.get('median_dd', 0):.1%}")
+            for f in rep.get("folds", []):
+                L.append(f"  fold{f['fold']}: v12 {f['v12']['exp_r']:+.2f}R(n={f['v12']['n']}) "
+                         f"vs q {f['quantum']['exp_r']:+.2f}R(n={f['quantum']['n']})")
+            return "\n".join(L)
+        except Exception as e:
+            return f"(lab report error: {e})"
+
+
+def quantum_walkforward(symbol=None, **kw):
+    """ONE-call validation: returns (report_dict, report_text)."""
+    try:
+        lab = WalkForwardLab(symbol=symbol or _qcfg("symbol", "XAUUSDm"))
+        rep = lab.run(**kw)
+        return (rep, lab.report_text(rep))
+    except Exception as e:
+        return ({"verdict": f"ERROR: {e}"}, f"walkforward error: {e}")
+
+
+SECTION_G_OK = True
+
+# ============================================================================
+# PHASE O — QUANTUM INDICATOR PACK (breathing lengths, scored divergences)
+# ----------------------------------------------------------------------------
+# The file's add_indicators() computes FIXED-length indicators. This pack adds
+# adaptive twins: every length breathes with volatility (ElasticEMA-style),
+# every oscillator is stochasticized against its own history, and divergences
+# carry pivot-validated strength scores. Consumers: radar votes + E5 context
+# (via the wiring layer) + the adaptive strategy shims (Phase L).
+# ============================================================================
+
+class QAdaptiveOsc:
+    """RSI/MFI/CCI-style oscillators with breathing length + history norm."""
+
+    @staticmethod
+    def _breath(close, base, floor=0.5, cap=2.0):
+        c = [float(v) for v in close]
+        n = len(c)
+        if n < 60:
+            return [1.0] * n
+        rets = [(c[i] / c[i - 1] - 1.0) if c[i - 1] else 0.0 for i in range(1, n)]
+        vols = []
+        for i in range(len(rets)):
+            win = rets[max(0, i - 49):i + 1]
+            m = sum(win) / max(1, len(win))
+            var = sum((x - m) ** 2 for x in win) / max(1, len(win) - 1)
+            vols.append(var ** 0.5 + 1e-12)
+        import statistics as _st
+        med = _st.median(vols) or 1e-9
+        return [1.0] + [min(cap, max(floor, v / med)) for v in vols]
+
+    @staticmethod
+    def rsi_adaptive(close, base=14):
+        """Wilder RSI with volatility-breathing length. Returns (last, series)."""
+        try:
+            c = [float(v) for v in close]
+            n = len(c)
+            if n < 30:
+                return (50.0, [50.0] * n)
+            br = QAdaptiveOsc._breath(c, base)
+            gains, losses = [0.0] * n, [0.0] * n
+            for i in range(1, n):
+                d = c[i] - c[i - 1]
+                gains[i] = d if d > 0 else 0.0
+                losses[i] = -d if d < 0 else 0.0
+            ag, al = sum(gains[1:base + 1]) / base, sum(losses[1:base + 1]) / base
+            out = [50.0] * n
+            for i in range(base + 1, n):
+                ln = qclip(base * br[i], 2, 200)
+                ag = (ag * (ln - 1) + gains[i]) / ln
+                al = (al * (ln - 1) + losses[i]) / ln
+                out[i] = 100.0 - 100.0 / (1 + ag / (al + 1e-12))
+            return (float(out[-1]), out)
+        except Exception:
+            return (50.0, [])
+
+    @staticmethod
+    def stochastic_of(series, n=14):
+        """%K of any series against its own rolling range (self-normalizing)."""
+        try:
+            s = [float(v) for v in series]
+            if len(s) < n + 2:
+                return 0.5
+            win = s[-n:]
+            hi, lo = max(win), min(win)
+            if hi - lo <= 1e-12:
+                return 0.5
+            return float(qclip((s[-1] - lo) / (hi - lo), 0, 1))
+        except Exception:
+            return 0.5
+
+    @staticmethod
+    def macd_adaptive(close, fast=12, slow=26, sig=9):
+        """MACD with breathing spans + histogram z-score. Returns dict."""
+        res = {"macd": 0.0, "signal": 0.0, "hist": 0.0, "hist_z": 0.0, "bull": False}
+        try:
+            c = [float(v) for v in close]
+            if len(c) < slow + sig + 10:
+                return res
+            br = QAdaptiveOsc._breath(c, slow)
+            def _ema(vals, span_list):
+                o = [vals[0]]
+                for i in range(1, len(vals)):
+                    a = 2.0 / (qclip(span_list[i], 2, 600) + 1.0)
+                    o.append(a * vals[i] + (1 - a) * o[-1])
+                return o
+            ef = _ema(c, [fast * b for b in br])
+            es = _ema(c, [slow * b for b in br])
+            macd = [a - b for a, b in zip(ef, es)]
+            sg = _ema(macd, [sig] * len(macd))
+            hist = [m - s for m, s in zip(macd, sg)]
+            res.update({"macd": float(macd[-1]), "signal": float(sg[-1]),
+                        "hist": float(hist[-1]), "bull": bool(hist[-1] > 0),
+                        "hist_z": float(qclip(q_zscore_list(hist, 100), -4, 4))})
+            return res
+        except Exception:
+            return res
+
+    @staticmethod
+    def squeeze_score(close, bb_n=20, kc_mult=1.5):
+        """TTM-squeeze state + expansion energy. Returns dict."""
+        res = {"squeeze": False, "energy": 0.0, "dir": 0.0}
+        try:
+            c = [float(v) for v in close]
+            if len(c) < bb_n + 20:
+                return res
+            import statistics as _st
+            win = c[-bb_n:]
+            m = sum(win) / len(win)
+            sd = _st.pstdev(win) + 1e-12
+            bb_w = 4 * sd
+            trs = [abs(c[i] - c[i - 1]) for i in range(-bb_n, 0)]
+            kc_w = 2 * kc_mult * (sum(trs) / len(trs))
+            res["squeeze"] = bool(bb_w < kc_w)
+            # Energy: compression depth + momentum ignition
+            depth = qclip(1 - bb_w / (kc_w + 1e-12), 0, 1)
+            mom = qclip((c[-1] - c[-6]) / (sd + 1e-12) / 3, -1, 1) if len(c) > 6 else 0
+            res["energy"] = float(depth * (0.4 + 0.6 * abs(mom)))
+            res["dir"] = float(qsign(mom))
+            return res
+        except Exception:
+            return res
+
+
+class QDivergenceEngine:
+    """Pivot-validated RSI/MACD divergences with strength scores.
+
+    A divergence needs: 2 price pivots + 2 oscillator pivots in opposition,
+    agreement of slope signs, and minimum pivot separation. Strength from
+    depth symmetry + oscillator extreme + recency.
+    """
+
+    @staticmethod
+    def pivots(s, left=4, right=4, kind="high"):
+        out = []
+        try:
+            n = len(s)
+            for i in range(left, n - right):
+                seg = s[i - left:i + right + 1]
+                if kind == "high" and s[i] == max(seg) and seg.count(s[i]) == 1:
+                    out.append(i)
+                if kind == "low" and s[i] == min(seg) and seg.count(s[i]) == 1:
+                    out.append(i)
+        except Exception:
+            pass
+        return out
+
+    def scan(self, close, osc, max_age=15):
+        """Returns list of {type, strength, age} newest-first (max 4)."""
+        out = []
+        try:
+            c = [float(v) for v in close]
+            o = [float(v) for v in osc]
+            n = min(len(c), len(o))
+            if n < 40:
+                return out
+            c, o = c[-120:], o[-120:]
+            n = len(c)
+            ph = self.pivots(c, 4, 4, "high")
+            pl = self.pivots(c, 4, 4, "low")
+            oh = self.pivots(o, 4, 4, "high")
+            ol = self.pivots(o, 4, 4, "low")
+            # Bearish: higher price high + lower osc high
+            for i in range(1, len(ph)):
+                i1, i2 = ph[i - 1], ph[i]
+                if n - 1 - i2 > max_age or i2 - i1 < 5:
+                    continue
+                o1 = max([j for j in oh if abs(j - i1) <= 3], default=None)
+                o2 = max([j for j in oh if abs(j - i2) <= 3], default=None)
+                if o1 is None or o2 is None:
+                    continue
+                if c[i2] > c[i1] and o[o2] < o[o1]:
+                    depth = abs(o[o1] - o[o2]) / (max(o) - min(o) + 1e-12)
+                    rec = 1 - (n - 1 - i2) / max(1, max_age)
+                    out.append({"type": "BEAR", "strength": float(qclip(0.4 + 0.4 * depth + 0.2 * rec, 0, 1)),
+                                "age": n - 1 - i2})
+            # Bullish: lower price low + higher osc low
+            for i in range(1, len(pl)):
+                i1, i2 = pl[i - 1], pl[i]
+                if n - 1 - i2 > max_age or i2 - i1 < 5:
+                    continue
+                o1 = max([j for j in ol if abs(j - i1) <= 3], default=None)
+                o2 = max([j for j in ol if abs(j - i2) <= 3], default=None)
+                if o1 is None or o2 is None:
+                    continue
+                if c[i2] < c[i1] and o[o2] > o[o1]:
+                    depth = abs(o[o2] - o[o1]) / (max(o) - min(o) + 1e-12)
+                    rec = 1 - (n - 1 - i2) / max(1, max_age)
+                    out.append({"type": "BULL", "strength": float(qclip(0.4 + 0.4 * depth + 0.2 * rec, 0, 1)),
+                                "age": n - 1 - i2})
+            out.sort(key=lambda d: (d["strength"], -d["age"]), reverse=True)
+            return out[:4]
+        except Exception:
+            return out
+
+
+class QChannelPack:
+    """Donchian + Keltner hybrid with quantile-adaptive multipliers."""
+
+    def analyze(self, df, don_n=20, kelt_n=20):
+        res = {"don_pos": 0.5, "kelt_pos": 0.5, "break_up": False, "break_dn": False,
+               "squeeze": False, "bias": 0.0}
+        try:
+            h = qas_series(df, "high")
+            l = qas_series(df, "low")
+            c = qas_series(df, "close")
+            if len(c) < don_n + 10:
+                return res
+            dh = max(h[-don_n:-1])
+            dl = min(l[-don_n:-1])
+            rng = dh - dl + 1e-12
+            res["don_pos"] = float(qclip((c[-1] - dl) / rng, 0, 1))
+            res["break_up"] = bool(c[-1] > dh)
+            res["break_dn"] = bool(c[-1] < dl)
+            m = sum(c[-kelt_n:]) / kelt_n
+            atr = q_atr_from_lists(h, l, c, 14)
+            a = atr[-1] if atr else rng / 4
+            # Adaptive multiplier: wider bands when breakouts recently failed
+            mult = 1.6
+            try:
+                fails = 0
+                for k in range(2, 12):
+                    if c[-k] > max(h[-k - don_n:-k]) and c[-k + 1] < c[-k]:
+                        fails += 1
+                mult = 1.4 + fails * 0.15
+            except Exception:
+                pass
+            ku, kd = m + mult * a, m - mult * a
+            res["kelt_pos"] = float(qclip((c[-1] - kd) / (ku - kd + 1e-12), 0, 1))
+            res["squeeze"] = bool((dh - dl) < (ku - kd) * 0.8)
+            res["bias"] = float(qclip((res["don_pos"] - 0.5) + (res["kelt_pos"] - 0.5), -1, 1))
+            return res
+        except Exception:
+            return res
+
+
+class QVolumePack:
+    """Volume pressure: signed flow, climax detection, dry-up warner."""
+
+    def analyze(self, df):
+        res = {"pressure": 0.0, "climax": False, "dry": False, "trend_vol": 0.0}
+        try:
+            o = qas_series(df, "open")
+            c = qas_series(df, "close")
+            v = VwapPack._vols(df)
+            n = min(len(o), len(c), len(v))
+            if n < 60:
+                return res
+            import statistics as _st
+            med = _st.median(v[-50:]) or 1.0
+            signed = [((1 if c[i] >= o[i] else -1) * v[i] / med) for i in range(n - 20, n)]
+            res["pressure"] = float(qclip(sum(signed) / 20.0 / 2.0, -1, 1))
+            res["climax"] = bool(v[-1] / med > 3.0 and abs(c[-1] - o[-1]) / (abs(c[-1]) + 1e-12) > 0.004)
+            res["dry"] = bool(sum(v[-10:]) / 10 / med < 0.55)
+            up_v = sum(v[i] for i in range(n - 20, n) if c[i] >= o[i])
+            dn_v = sum(v[i] for i in range(n - 20, n) if c[i] < o[i])
+            res["trend_vol"] = float(qclip((up_v - dn_v) / (up_v + dn_v + 1e-12), -1, 1))
+            return res
+        except Exception:
+            return res
+
+
+class QuantumIndicatorPack:
+    """O facade: one call -> full adaptive indicator evidence."""
+
+    def __init__(self):
+        self.div = QDivergenceEngine()
+        self.chan = QChannelPack()
+        self.vol = QVolumePack()
+
+    def analyze(self, df):
+        out = {"bias": 0.0, "conf": 0.0, "rsi": 50.0, "rsi_k": 0.5,
+               "macd": {}, "squeeze": {}, "divs": [], "channel": {},
+               "volume": {}, "votes": []}
+        try:
+            c = qas_series(df, "close")
+            if len(c) < 80:
+                return out
+            rsi_last, rsi_s = QAdaptiveOsc.rsi_adaptive(c, 14)
+            rk = QAdaptiveOsc.stochastic_of(rsi_s or [50.0], 14)
+            macd = QAdaptiveOsc.macd_adaptive(c)
+            sq = QAdaptiveOsc.squeeze_score(c)
+            ch = self.chan.analyze(df)
+            vo = self.vol.analyze(df)
+            divs = self.div.scan(c, rsi_s or c) if rsi_s else []
+            out.update({"rsi": float(rsi_last), "rsi_k": float(rk), "macd": macd,
+                        "squeeze": sq, "divs": divs, "channel": ch, "volume": vo})
+            votes = []
+            votes.append(("rsi", (rk - 0.5) * 1.6, 0.6))
+            votes.append(("macd", qsign(macd["hist"]) * qclip(abs(macd["hist_z"]) / 2, 0.2, 1), 0.7))
+            votes.append(("channel", ch["bias"], 0.8))
+            votes.append(("volume", vo["pressure"] * 0.7 + vo["trend_vol"] * 0.3, 0.5))
+            if divs:
+                d0 = divs[0]
+                votes.append(("div", (0.9 if d0["type"] == "BULL" else -0.9) * d0["strength"], 0.9))
+            if sq["squeeze"] and sq["energy"] > 0.4:
+                votes.append(("squeeze", sq["dir"] * sq["energy"], 0.8))
+            tot = sum(w for _, _, w in votes) or 1.0
+            bias = sum(b * w for _, b, w in votes) / tot
+            bs = [b for _, b, _ in votes]
+            agree = 1 - (max(bs) - min(bs)) / 4 if bs else 0
+            out["bias"] = float(qclip(bias, -1, 1))
+            out["conf"] = float(qclip(agree, 0, 1))
+            out["votes"] = [{"src": s, "bias": round(float(b), 3)} for s, b, _ in votes]
+            return out
+        except Exception:
+            return out
+
+
+_QIND_SINGLETON = {"obj": None}
+
+
+def quantum_indicators(df):
+    try:
+        o = _QIND_SINGLETON.get("obj")
+        if o is None:
+            o = QuantumIndicatorPack()
+            _QIND_SINGLETON["obj"] = o
+        return o.analyze(df)
+    except Exception:
+        return {"bias": 0.0, "conf": 0.0}
+
+
+SECTION_O_OK = True
+
+# ============================================================================
+# PHASE I — QUANTUM EXECUTION TOOLKIT (resilient MT5 interfacing)
+# ----------------------------------------------------------------------------
+# Thin, paranoid helpers around the file's MT5 client. Never places orders
+# itself: produces validated data + execution PLANS the wiring layer applies.
+# ============================================================================
+
+class QTickCache:
+    """Fresh-tick cache with age tracking (avoids MT5 hammering)."""
+
+    def __init__(self, max_age_sec=5):
+        self.max_age = float(max_age_sec)
+        self.cache = {}
+
+    def get(self, symbol=None):
+        import time as _t
+        sym = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        now = _t.time()
+        hit = self.cache.get(sym)
+        if hit and now - hit["t"] < self.max_age:
+            return hit["tick"]
+        tick = None
+        try:
+            mt5c = globals().get("MT5")
+            if mt5c is not None and hasattr(mt5c, "get_fresh_tick"):
+                tick = mt5c.get_fresh_tick(sym)
+        except Exception:
+            pass
+        if tick is None:
+            try:
+                mt5c = globals().get("MT5")
+                if mt5c is not None and hasattr(mt5c, "get_tick"):
+                    tick = mt5c.get_tick(sym)
+            except Exception:
+                pass
+        tick = self._norm(tick)
+        self.cache[sym] = {"t": now, "tick": tick}
+        return tick
+
+    @staticmethod
+    def _norm(tick):
+        out = {"bid": 0.0, "ask": 0.0, "spread": None, "time": None}
+        try:
+            if tick is None:
+                return out
+            if isinstance(tick, dict):
+                out["bid"] = float(tick.get("bid", 0) or 0)
+                out["ask"] = float(tick.get("ask", 0) or 0)
+                out["time"] = tick.get("time")
+            else:
+                out["bid"] = float(getattr(tick, "bid", 0) or 0)
+                out["ask"] = float(getattr(tick, "ask", 0) or 0)
+                out["time"] = getattr(tick, "time", None)
+            if out["ask"] > out["bid"] > 0:
+                out["spread"] = out["ask"] - out["bid"]
+        except Exception:
+            pass
+        return out
+
+
+_TICK_CACHE = {"obj": None}
+
+
+def qtick(symbol=None):
+    try:
+        o = _TICK_CACHE.get("obj")
+        if o is None:
+            o = QTickCache()
+            _TICK_CACHE["obj"] = o
+        return o.get(symbol)
+    except Exception:
+        return {"bid": 0.0, "ask": 0.0, "spread": None, "time": None}
+
+
+class QResilientFetch:
+    """MT5 fetch with retry/backoff + frame validation + gap report."""
+
+    def __init__(self, tries=3, pause=0.4):
+        self.tries = int(tries)
+        self.pause = float(pause)
+
+    def fetch(self, symbol, tf, count=500):
+        """Returns (df_or_None, report_dict). Never raises."""
+        rep = {"ok": False, "tries": 0, "bars": 0, "gaps": 0, "err": ""}
+        df = None
+        try:
+            import time as _t
+            mt5c = globals().get("MT5")
+            if mt5c is None or not hasattr(mt5c, "fetch"):
+                rep["err"] = "no MT5 client"
+                return (None, rep)
+            for a in range(self.tries):
+                rep["tries"] = a + 1
+                try:
+                    df = mt5c.fetch(symbol, tf, count)
+                    if df is not None and len(df) >= 60:
+                        rep["ok"] = True
+                        rep["bars"] = int(len(df))
+                        break
+                except Exception as e:
+                    rep["err"] = str(e)[:120]
+                _t.sleep(self.pause * (a + 1))
+            if rep["ok"]:
+                try:
+                    idx = getattr(df, "index", None)
+                    if idx is not None and len(idx) > 10:
+                        import pandas as _pd
+                        d = _pd.DatetimeIndex(idx).to_series().diff().dropna()
+                        if len(d):
+                            step = d.median()
+                            if step and step > _pd.Timedelta(0):
+                                rep["gaps"] = int((d > step * 3).sum())
+                except Exception:
+                    pass
+        except Exception as e:
+            rep["err"] = str(e)[:120]
+        return (df, rep)
+
+    def fetch_many(self, symbol, tfs, count=500):
+        out, reps = {}, {}
+        for tf in tfs or []:
+            df, rep = self.fetch(symbol, tf, count)
+            if df is not None:
+                out[tf] = df
+            reps[tf] = rep
+        return (out, reps)
+
+
+class QSpreadLogger:
+    """Logs spread to STORE + SpreadState on every call (one line of wiring)."""
+
+    @staticmethod
+    def log(symbol=None, spread=None):
+        try:
+            sym = str(symbol or _qcfg("symbol", "XAUUSDm"))
+            if spread is None:
+                t = qtick(sym)
+                spread = t.get("spread")
+            if spread is None:
+                return False
+            gate = get_early_gate(sym)
+            if gate is not None:
+                gate.observe_tick(spread=spread)
+            try:
+                st = _qstore()
+                if st is not None and hasattr(st, "log_spread"):
+                    st.log_spread(sym, float(spread))
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+
+class QSmartPlacer:
+    """Limit-vs-market plan from spread percentile + urgency + zone map.
+
+    Returns a PLAN dict the wiring applies via the file's SmartOrderRouter /
+    MT5 client. Never sends orders itself (testable, backtestable).
+    """
+
+    @staticmethod
+    def plan(direction, price, sl, tp, lot, spread=None, spread_pctile=0.5,
+             urgency=0.5, zone_edge=None):
+        """Returns {kind: market|limit|stoplimit, price, reason, ...}."""
+        out = {"kind": "market", "price": float(price or 0),
+               "sl": float(sl or 0), "tp": float(tp or 0),
+               "lot": float(lot or 0), "reason": "default market"}
+        try:
+            d = "BUY" if str(direction).upper().startswith("B") else "SELL"
+            pct = qclip(spread_pctile, 0, 1)
+            urg = qclip(urgency, 0, 1)
+            # Patient + wide spread + zone edge => limit at better price
+            if urg < 0.45 and pct > 0.55 and zone_edge:
+                try:
+                    ze = float(zone_edge)
+                    px = float(price)
+                    if d == "BUY" and ze < px:
+                        out.update({"kind": "limit", "price": ze, "reason": "zone limit (patient, wide spread)"})
+                        return out
+                    if d == "SELL" and ze > px:
+                        out.update({"kind": "limit", "price": ze, "reason": "zone limit (patient, wide spread)"})
+                        return out
+                except Exception:
+                    pass
+            # Calm + tight spread => market is fine
+            if pct < 0.4 or urg > 0.7:
+                out["reason"] = f"market (spread p{int(pct * 100)}, urgency {urg:.2f})"
+                return out
+            # Middle ground: limit at mid-touch improvement when spread wide
+            if pct >= 0.4 and spread:
+                try:
+                    improve = float(spread) * 0.4
+                    px = float(price)
+                    out.update({"kind": "limit",
+                                "price": px - improve if d == "BUY" else px + improve,
+                                "reason": f"touch-improve limit (spread p{int(pct * 100)})"})
+                    return out
+                except Exception:
+                    pass
+            out["reason"] = "market fallback"
+            return out
+        except Exception as e:
+            out["reason"] = f"planner fail-open: {e}"
+            return out
+
+
+class QSlippageGuard:
+    """Compares realized slip vs baseline; vetoes when toxic."""
+
+    def __init__(self, symbol=None):
+        self.symbol = str(symbol or _qcfg("symbol", "XAUUSDm"))
+        self.base = EWMAStat(alpha=0.08, name=f"slip_{self.symbol}")
+        self._load()
+
+    def _load(self):
+        try:
+            d = qpersist_load(f"slip_{self.symbol}")
+            if isinstance(d, dict):
+                self.base = EWMAStat.from_dict(d)
+        except Exception:
+            pass
+
+    def save(self):
+        try:
+            return qpersist_save(f"slip_{self.symbol}", self.base.to_dict())
+        except Exception:
+            return False
+
+    def observe_fill(self, expected, filled, atr=None):
+        """Record a fill; returns toxicity verdict dict."""
+        out = {"toxic": False, "slip_atr": 0.0, "z": 0.0}
+        try:
+            slip = abs(float(filled) - float(expected))
+            a = float(atr or 0) or 1e-9
+            satr = slip / a
+            out["slip_atr"] = float(satr)
+            out["z"] = float(self.base.z(satr))
+            self.base.update(satr)
+            out["toxic"] = bool(out["z"] > 3.0 and satr > 0.3)
+            self.save()
+            return out
+        except Exception:
+            return out
+
+
+SECTION_I_OK = True
+
+
+# ============================================================================
+# PHASE J — PORTFOLIO BRAIN (the book thinks as one organism)
+# ----------------------------------------------------------------------------
+# XAU + BTC (+DXY context) share one equity pool. This brain nets exposure,
+# brakes correlated adds, and scales each symbol's local verdict by GLOBAL
+# heat. Wraps the file's engines; vetoes by returning scale 0 with reasons.
+# ============================================================================
+
+class BookSnapshot:
+    """Point-in-time portfolio picture from MT5 or STORE."""
+
+    @staticmethod
+    def capture():
+        отражает = {"positions": [], "n": 0, "symbols": {}}
+        try:
+            poss = []
+            try:
+                mt5c = globals().get("MT5")
+                if mt5c is not None and hasattr(mt5c, "get_all_account_positions"):
+                    raw = mt5c.get_all_account_positions() or []
+                    for p in raw:
+                        try:
+                            poss.append({
+                                "symbol": str(getattr(p, "symbol", "?")),
+                                "dir": "BUY" if int(getattr(p, "type", 0)) == 0 else "SELL",
+                                "vol": float(getattr(p, "volume", 0) or 0),
+                                "entry": float(getattr(p, "price_open", 0) or 0),
+                                "current": float(getattr(p, "price_current", 0) or 0),
+                                "profit": float(getattr(p, "profit", 0) or 0),
+                                "ticket": getattr(p, "ticket", None)})
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            if not poss:
+                try:
+                    st = _qstore()
+                    if st is not None and hasattr(st, "open_trades"):
+                        for t in st.open_trades() or []:
+                            poss.append({"symbol": str(t.get("symbol", _qcfg("symbol", "?"))),
+                                         "dir": str(t.get("dir", "?")), "vol": float(t.get("vol", 0) or 0),
+                                         "entry": float(t.get("entry", 0) or 0),
+                                         "current": float(t.get("current", t.get("entry", 0)) or 0),
+                                         "profit": float(t.get("profit", 0) or 0),
+                                         "ticket": t.get("ticket")})
+                except Exception:
+                    pass
+            отражает["positions"] = poss
+            отражает["n"] = len(poss)
+            by = {}
+            for p in poss:
+                by.setdefault(p["symbol"], []).append(p)
+            отражает["symbols"] = {k: len(v) for k, v in by.items()}
+            отражает["by_symbol"] = by
+            return отражает
+        except Exception:
+            return отражает
+
+    @staticmethod
+    def net_bias_btc_xau(book):
+        """Net crypto-vs-metal bias for correlation braking. Returns dict."""
+        out = {"XAU": 0.0, "BTC": 0.0}
+        try:
+            for p in (book or {}).get("positions", []) or []:
+                s = str(p.get("symbol", "")).upper()
+                d = 1.0 if str(p.get("dir", "")).upper().startswith("B") else -1.0
+                w = abs(float(p.get("vol", 0) or 0))
+                if "XAU" in s or "GOLD" in s:
+                    out["XAU"] += d * w
+                elif "BTC" in s:
+                    out["BTC"] += d * w
+        except Exception:
+            pass
+        return out
+
+
+class ExposureNetting:
+    """Gross/net exposure in RISK units (fraction of equity at stop)."""
+
+    @staticmethod
+    def heat_of(book, equity=None):
+        tot = 0.0
+        try:
+            eq = float(equity or 0) or float(_qcfg("account_balance", 0) or 0) or 1.0
+            for p in (book or {}).get("positions", []) or []:
+                try:
+                    # Prefer stored risk fraction; else profit-implied proxy
+                    rf = p.get("risk_fraction", None)
+                    if rf is not None:
+                        tot += abs(float(rf))
+                    else:
+                        # Proxy: open profit swing as heat is wrong; use vol-implied:
+                        # XAU 0.01 lot ~= $1/point-ish => heat ~= vol*100*stop_atr/eq
+                        atr = float(p.get("atr", 0) or 0)
+                        vol = abs(float(p.get("vol", 0) or 0))
+                        stop_atr = float(_qcfg("stop_atr_mult", _qcfg("xau_adr_mult", 2.0)))
+                        if atr > 0 and eq > 0:
+                            contract = 100.0 if "XAU" in str(p.get("symbol", "")).upper() else 1.0
+                            tot += vol * contract * atr * stop_atr / eq
+                except Exception:
+                    continue
+            return float(tot)
+        except Exception:
+            return 0.0
+
+
+class PortfolioBrain:
+    """Global gate over local per-symbol verdicts."""
+
+    def __init__(self):
+        self.max_heat = float(_qcfg("quantum_max_heat", 0.80))
+        self.max_positions = int(_qcfg("max_positions", 3))
+
+    def review(self, symbol, local_action, local_size, direction,
+               equity=None, book=None):
+        """Returns {allow, scale, reasons}. Never raises."""
+        out = {"allow": True, "scale": 1.0, "reasons": []}
+        try:
+            if str(local_action).upper() != "TRADE":
+                out["allow"] = False
+                out["reasons"].append("local verdict is HOLD")
+                return out
+            book = book if book is not None else BookSnapshot.capture()
+            n = int(book.get("n", 0))
+            if n >= self.max_positions:
+                out["allow"] = False
+                out["reasons"].append(f"book full ({n}/{self.max_positions})")
+                return out
+            heat = ExposureNetting.heat_of(book, equity)
+            if heat >= self.max_heat:
+                out["allow"] = False
+                out["reasons"].append(f"portfolio heat {heat:.2f} >= cap {self.max_heat:.2f}")
+                return out
+            # Scale down as heat approaches cap (linear ramp last 40%)
+            if heat > self.max_heat * 0.6:
+                ramp = 1 - (heat - self.max_heat * 0.6) / (self.max_heat * 0.4 + 1e-12)
+                out["scale"] *= qclip(ramp, 0.2, 1.0)
+                out["reasons"].append(f"heat ramp x{out['scale']:.2f} (heat {heat:.2f})")
+            # Same-symbol stack brake: 3rd+ same-direction add needs room
+            try:
+                syms = (book.get("by_symbol", {}) or {}).get(symbol, [])
+                same = sum(1 for p in syms if str(p.get("dir", "")).upper().startswith(str(direction)[:1].upper()))
+                if same >= 2:
+                    out["scale"] *= 0.5
+                    out["reasons"].append(f"same-symbol stack x0.5 ({same} already)")
+            except Exception:
+                pass
+            # XAU/BTC cross-brake via realized correlation (risk-on/off coupling)
+            try:
+                bias = BookSnapshot.net_bias_btc_xau(book)
+                nd = 1.0 if str(direction).upper().startswith("B") else -1.0
+                s = str(symbol).upper()
+                if "XAU" in s and bias["XAU"] * nd > 0 and abs(bias["XAU"]) >= 0.03:
+                    out["scale"] *= 0.7
+                    out["reasons"].append("XAU stack brake x0.7")
+                if "BTC" in s and bias["BTC"] * nd > 0 and abs(bias["BTC"]) >= 0.5:
+                    out["scale"] *= 0.7
+                    out["reasons"].append("BTC stack brake x0.7")
+            except Exception:
+                pass
+            out["scale"] = float(qclip(out["scale"] * float(local_size or 1.0), 0.0, 1.0))
+            if out["scale"] <= 0.01:
+                out["allow"] = False
+                out["reasons"].append("scaled to dust")
+            else:
+                out["reasons"].append(f"global scale x{out['scale']:.2f}")
+            return out
+        except Exception as e:
+            out["reasons"].append(f"fail-open: {e}")
+            return out
+
+
+_PORT_BRAIN = {"obj": None}
+
+
+def get_portfolio_brain():
+    try:
+        o = _PORT_BRAIN.get("obj")
+        if o is None:
+            o = PortfolioBrain()
+            _PORT_BRAIN["obj"] = o
+        return o
+    except Exception:
+        return None
+
+
+SECTION_J_OK = True
