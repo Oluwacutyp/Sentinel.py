@@ -31935,3 +31935,646 @@ def quantum_ladder(setup_class):
 
 
 SECTION_G2_OK = True
+
+# ============================================================================
+# R — QUANTUM REPORTS (HTML tearsheets in the backtest-file tradition)
+# T — SYMBOL SPECIFICATIONS (per-symbol breathing room, no hardcoded pips)
+# Q — QUANTUM CLI (operator console: status, calibrate, backtest, report)
+# PROLOGUE — version banner, changelog, architecture map, runbook
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# T — SYMBOL SPECIFICATIONS
+# ----------------------------------------------------------------------------
+
+class SymbolSpec:
+    """Per-symbol contract facts + adaptive microstructure memory.
+
+    Point values / contract sizes are FACTS (from the broker), not maths —
+    everything else (stops, targets, spreads) is learned or quantile-based.
+    Unknown symbols get a safe generic template that calibrates itself.
+    """
+
+    GENERIC = {"digits": 2, "point": 0.01, "tick_value": 1.0, "tick_size": 0.01,
+               "contract": 100.0, "volume_min": 0.01, "volume_step": 0.01,
+               "spread_warn_atr": 0.08, "sl_min_atr": 0.8, "session": "24x5",
+               "notes": "generic template — calibrates on first 500 bars"}
+
+    TABLE = {
+        "XAUUSD": {"digits": 2, "point": 0.01, "tick_value": 1.0, "tick_size": 0.01,
+                   "contract": 100.0, "volume_min": 0.01, "volume_step": 0.01,
+                   "spread_warn_atr": 0.06, "sl_min_atr": 0.9, "session": "24x5",
+                   "killzones": ("LONDON", "OVERLAP", "NEWYORK"),
+                   "notes": "metals: wide stops, news-sensitive (CPI/NFP/FOMC)"},
+        "XAUUSDm": {"digits": 2, "point": 0.01, "tick_value": 1.0, "tick_size": 0.01,
+                    "contract": 100.0, "volume_min": 0.01, "volume_step": 0.01,
+                    "spread_warn_atr": 0.06, "sl_min_atr": 0.9, "session": "24x5",
+                    "killzones": ("LONDON", "OVERLAP", "NEWYORK"),
+                    "notes": "micro XAU variant — same profile as XAUUSD"},
+        "BTCUSD": {"digits": 2, "point": 0.01, "tick_value": 1.0, "tick_size": 0.01,
+                   "contract": 1.0, "volume_min": 0.01, "volume_step": 0.01,
+                   "spread_warn_atr": 0.03, "sl_min_atr": 1.2, "session": "24x7",
+                   "killzones": ("OVERLAP", "NEWYORK", "ASIA"),
+                   "notes": "crypto: 24/7, fat tails, weekend gaps — wider conformal band"},
+        "BTCUSDm": {"digits": 2, "point": 0.01, "tick_value": 1.0, "tick_size": 0.01,
+                    "contract": 1.0, "volume_min": 0.01, "volume_step": 0.01,
+                    "spread_warn_atr": 0.03, "sl_min_atr": 1.2, "session": "24x7",
+                    "killzones": ("OVERLAP", "NEWYORK", "ASIA"),
+                    "notes": "micro BTC variant"},
+        "EURUSD": {"digits": 5, "point": 0.00001, "tick_value": 1.0, "tick_size": 0.00001,
+                   "contract": 100000.0, "volume_min": 0.01, "volume_step": 0.01,
+                   "spread_warn_atr": 0.05, "sl_min_atr": 0.8, "session": "24x5",
+                   "killzones": ("LONDON", "OVERLAP"),
+                   "notes": "fx major: tight spreads, session-driven"},
+        "GBPUSD": {"digits": 5, "point": 0.00001, "tick_value": 1.0, "tick_size": 0.00001,
+                   "contract": 100000.0, "volume_min": 0.01, "volume_step": 0.01,
+                   "spread_warn_atr": 0.05, "sl_min_atr": 1.0, "session": "24x5",
+                   "killzones": ("LONDON", "OVERLAP"),
+                   "notes": "cable: spikier than EUR — extra slippage guard"},
+        "USDJPY": {"digits": 3, "point": 0.001, "tick_value": 1.0, "tick_size": 0.001,
+                   "contract": 100000.0, "volume_min": 0.01, "volume_step": 0.01,
+                   "spread_warn_atr": 0.05, "sl_min_atr": 0.8, "session": "24x5",
+                   "killzones": ("ASIA", "OVERLAP"),
+                   "notes": "yen: intervention risk — news sentinel always armed"},
+    }
+
+    _live_overrides = {}
+
+    def __init__(self, symbol):
+        self.symbol = str(symbol).upper()
+        base = None
+        for key in (self.symbol, self.symbol.rstrip("m").rstrip("."),
+                    self.symbol.split(".")[0]):
+            if key in self.TABLE:
+                base = self.TABLE[key]
+                break
+        self.spec = dict(self.GENERIC)
+        if base:
+            self.spec.update(base)
+        self.spec.update(self._live_overrides.get(self.symbol, {}))
+        self._spread_win = QuantileWindow(1000)
+        self._atr_win = QuantileWindow(1000)
+
+    @classmethod
+    def from_mt5(cls, symbol, mt5_module=None):
+        """Build/refresh spec from live MT5 symbol_info (facts, not maths)."""
+        self = cls(symbol)
+        try:
+            mt5 = mt5_module
+            if mt5 is None:
+                try:
+                    import MetaTrader5 as mt5  # noqa
+                except Exception:
+                    return self
+            info = mt5.symbol_info(symbol)
+            if info is not None:
+                ov = {}
+                for k in ("digits", "point", "tick_value", "tick_size",
+                          "trade_contract_size", "volume_min", "volume_step"):
+                    v = getattr(info, k, None)
+                    if v:
+                        ov["contract" if k == "trade_contract_size" else k] = v
+                self.spec.update(ov)
+                cls._live_overrides[self.symbol] = ov
+        except Exception:
+            pass
+        return self
+
+    def observe(self, spread=None, atr=None):
+        try:
+            if spread is not None:
+                self._spread_win.add(float(spread))
+            if atr is not None:
+                self._atr_win.add(float(atr))
+        except Exception:
+            pass
+
+    def spread_ok(self, spread, atr):
+        """Spread gate vs own history AND the warn ratio — whichever is safer."""
+        try:
+            if atr and atr > 0 and spread / atr > self.spec["spread_warn_atr"] * 2.5:
+                return False
+            if len(self._spread_win) >= 50:
+                return self._spread_win.percentile(float(spread)) < 0.97
+            return True
+        except Exception:
+            return True
+
+    def round_vol(self, vol):
+        try:
+            step = self.spec["volume_step"]
+            mn = self.spec["volume_min"]
+            v = max(mn, round(float(vol) / step) * step)
+            return round(v, 8)
+        except Exception:
+            return vol
+
+    def round_px(self, px):
+        try:
+            return round(float(px), int(self.spec["digits"]))
+        except Exception:
+            return px
+
+    def as_dict(self):
+        d = dict(self.spec)
+        d["symbol"] = self.symbol
+        return d
+
+
+_SPEC_CACHE = {}
+
+
+def quantum_spec(symbol):
+    try:
+        k = str(symbol).upper()
+        s = _SPEC_CACHE.get(k)
+        if s is None:
+            s = SymbolSpec(k)
+            _SPEC_CACHE[k] = s
+        return s
+    except Exception:
+        return SymbolSpec("GENERIC")
+
+
+# ----------------------------------------------------------------------------
+# R — HTML REPORT BUILDER (tearsheets like the backtest_*.html tradition)
+# ----------------------------------------------------------------------------
+
+def _html_esc(x):
+    try:
+        return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    except Exception:
+        return "?"
+
+
+class QuantumTearsheet:
+    """Single-file HTML report: equity, stats, regimes, attribution, journal."""
+
+    CSS = ("body{font-family:Arial,Helvetica,sans-serif;background:#0e1117;color:#e6e6e6;"
+           "margin:0;padding:24px}h1{color:#7fd4ff}h2{color:#9fe8c1;border-bottom:1px solid #333;"
+           "padding-bottom:4px}table{border-collapse:collapse;margin:12px 0;min-width:60%}"
+           "th,td{border:1px solid #333;padding:6px 10px;text-align:right;font-size:13px}"
+           "th{background:#1b2430;color:#ffd479;text-align:right}"
+           "td:first-child,th:first-child{text-align:left}.pos{color:#58d68d}.neg{color:#ff6b6b}"
+           ".grid{display:flex;gap:24px;flex-wrap:wrap}.card{background:#161b26;border:1px solid #2a3344;"
+           "border-radius:8px;padding:12px 18px;min-width:220px}"
+           ".big{font-size:26px;font-weight:bold}pre{background:#161b26;padding:12px;border-radius:8px;"
+           "font-size:12px;overflow-x:auto}.foot{color:#888;font-size:12px;margin-top:24px}")
+
+    def __init__(self, title="Sentinel Quantum Report"):
+        self.title = title
+        self.sections = []
+
+    def add_cards(self, cards):
+        """cards: [(label, value, good|bad|None)]"""
+        h = ['<div class="grid">']
+        for label, val, tone in cards:
+            cls = "big pos" if tone == "good" else ("big neg" if tone == "bad" else "big")
+            h.append(f'<div class="card"><div>{_html_esc(label)}</div>'
+                     f'<div class="{cls}">{_html_esc(val)}</div></div>')
+        h.append("</div>")
+        self.sections.append("\n".join(h))
+
+    def add_table(self, title, columns, rows, money_cols=()):
+        h = [f"<h2>{_html_esc(title)}</h2>", "<table><tr>"]
+        h.append("".join(f"<th>{_html_esc(c)}</th>" for c in columns))
+        h.append("</tr>")
+        for r in rows:
+            h.append("<tr>")
+            for i, v in enumerate(r):
+                tone = ""
+                if i in money_cols:
+                    try:
+                        tone = " class='pos'" if float(v) >= 0 else " class='neg'"
+                    except Exception:
+                        pass
+                h.append(f"<td{tone}>{_html_esc(v)}</td>")
+            h.append("</tr>")
+        h.append("</table>")
+        self.sections.append("\n".join(h))
+
+    def add_pre(self, title, text):
+        self.sections.append(f"<h2>{_html_esc(title)}</h2><pre>{_html_esc(text)}</pre>")
+
+    def add_equity_svg(self, equity, w=900, hgt=220, title="Equity"):
+        try:
+            eq = [float(x) for x in equity if x is not None]
+            if len(eq) < 2:
+                return
+            mn, mx = min(eq), max(eq)
+            rng = (mx - mn) or 1.0
+            pts = []
+            for i, v in enumerate(eq):
+                x = 10 + i / (len(eq) - 1) * (w - 20)
+                y = hgt - 10 - (v - mn) / rng * (hgt - 20)
+                pts.append(f"{x:.1f},{y:.1f}")
+            up = eq[-1] >= eq[0]
+            col = "#58d68d" if up else "#ff6b6b"
+            svg = (f"<h2>{_html_esc(title)}</h2><svg width='{w}' height='{hgt}' "
+                   f"style='background:#161b26;border-radius:8px'>"
+                   f"<polyline points='{' '.join(pts)}' fill='none' stroke='{col}' "
+                   f"stroke-width='1.6'/></svg>")
+            self.sections.append(svg)
+        except Exception:
+            pass
+
+    def render(self):
+        return ("<!DOCTYPE html><html><head><meta charset='utf-8'><title>"
+                + _html_esc(self.title) + "</title><style>" + self.CSS + "</style></head>"
+                "<body><h1>" + _html_esc(self.title) + "</h1>"
+                + "\n".join(self.sections)
+                + "<div class='foot'>Generated by Sentinel Quantum Core · "
+                + _html_esc(quantum_version()) + "</div></body></html>")
+
+    def save(self, path):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.render())
+            return path
+        except Exception as e:
+            return f"ERROR: {e}"
+
+
+def quantum_backtest_report(trades, equity, path="quantum_report.html",
+                            title="Sentinel Quantum Backtest", extra=None):
+    """trades: [{r, pnl, side, strategy, regime, entry_t, exit_t}], equity: [..]."""
+    try:
+        rep = QuantumTearsheet(title)
+        rs = [float(t.get("r", 0)) for t in trades]
+        pnls = [float(t.get("pnl", 0)) for t in trades]
+        n = len(rs)
+        wins = [r for r in rs if r > 0]
+        wr = len(wins) / n if n else 0
+        pf = (sum(wins) / abs(sum(r for r in rs if r <= 0))) if any(r <= 0 for r in rs) else float("inf")
+        ev = sum(rs) / n if n else 0
+        # Max drawdown on equity
+        peak, mdd = -1e18, 0.0
+        for v in equity:
+            peak = max(peak, v)
+            mdd = min(mdd, v - peak)
+        rep.add_cards([
+            ("Net R", f"{sum(rs):+.1f}R", "good" if sum(rs) > 0 else "bad"),
+            ("Profit Factor", f"{pf:.2f}" if pf != float("inf") else "inf",
+             "good" if pf > 1.3 else ("bad" if pf < 1.0 else None)),
+            ("Win Rate", f"{wr:.1%}", None),
+            ("Expectancy", f"{ev:+.3f}R", "good" if ev > 0 else "bad"),
+            ("Trades", str(n), None),
+            ("Max DD", f"{mdd:+.2f}", "bad" if mdd < 0 else None),
+        ])
+        rep.add_equity_svg(equity)
+        # Per-strategy
+        by_s = {}
+        for t in trades:
+            by_s.setdefault(str(t.get("strategy", "?")), []).append(float(t.get("r", 0)))
+        rows = []
+        for s, lrs in sorted(by_s.items(), key=lambda t: -sum(t[1])):
+            w = sum(1 for r in lrs if r > 0) / len(lrs)
+            rows.append((s, len(lrs), f"{w:.0%}", f"{sum(lrs):+.1f}", f"{sum(lrs)/len(lrs):+.3f}"))
+        if rows:
+            rep.add_table("Per-Strategy", ("Strategy", "N", "Win%", "Net R", "Exp R"),
+                          rows, money_cols=(3, 4))
+        # Per-regime
+        by_r = {}
+        for t in trades:
+            by_r.setdefault(str(t.get("regime", "?")), []).append(float(t.get("r", 0)))
+        rows = []
+        for s, lrs in sorted(by_r.items(), key=lambda t: -sum(t[1])):
+            w = sum(1 for r in lrs if r > 0) / len(lrs)
+            rows.append((s, len(lrs), f"{w:.0%}", f"{sum(lrs):+.1f}", f"{sum(lrs)/len(lrs):+.3f}"))
+        if rows:
+            rep.add_table("Per-Regime", ("Regime", "N", "Win%", "Net R", "Exp R"),
+                          rows, money_cols=(3, 4))
+        try:
+            rep.add_pre("Calibration / Walk-Forward",
+                        quantum_calibration_report() + "\n\n" + quantum_walkforward_report())
+        except Exception:
+            pass
+        try:
+            rep.add_pre("Signal Attribution (global)",
+                        "\n".join(f"{k}: {v}" for k, v in quantum_global_importance().items()) or "n/a")
+        except Exception:
+            pass
+        try:
+            rep.add_pre("L2 Leaderboard",
+                        "\n".join(str(r) for r in l2_leaderboard()) or "n/a")
+        except Exception:
+            pass
+        if extra:
+            for title2, body in extra:
+                rep.add_pre(title2, body)
+        return rep.save(path)
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def quantum_live_status_report(path="quantum_live_status.html"):
+    """Snapshot report for a running bot: health, journal tail, positions."""
+    try:
+        rep = QuantumTearsheet("Sentinel Quantum Live Status")
+        try:
+            h = quantum_health() if "quantum_health" in dir() else {}
+        except Exception:
+            h = {}
+        cards = []
+        for k in ("enabled", "cycle", "open_trades", "daily_r", "drawdown_r", "last_brain_update"):
+            if k in h:
+                cards.append((k, str(h[k]), None))
+        if cards:
+            rep.add_cards(cards)
+        try:
+            rep.add_pre("Self-Test", quantum_selftest_text())
+        except Exception:
+            pass
+        try:
+            rep.add_pre("Recent Decisions", quantum_journal_tail(20))
+        except Exception:
+            pass
+        return rep.save(path)
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+# ----------------------------------------------------------------------------
+# Q — QUANTUM CLI (operator console)
+# ----------------------------------------------------------------------------
+
+QUANTUM_CLI_HELP = """Sentinel Quantum CLI
+  status              one-screen health + diagnostics
+  selftest            run the 13-module self-test
+  calibrate           run live calibration now (needs STORE/decisions)
+  backtest FILE [SYM] run quantum backtest on CSV (time,open,high,low,close[,tickvol])
+  report              write quantum_live_status.html
+  leaderboard         L2 strategy leaderboard
+  importance          global signal attribution
+  autopsy             false-signal autopsy cluster report
+  spec SYMBOL         show symbol spec
+  version             version + changelog tail
+  help                this text
+""".strip()
+
+
+def quantum_cli(argv=None):
+    import sys as _sys
+    args = list(argv) if argv is not None else _sys.argv[1:]
+    if not args or args[0] in ("help", "-h", "--help"):
+        print(QUANTUM_CLI_HELP)
+        return 0
+    cmd = args[0].lower()
+    try:
+        if cmd == "status":
+            print(quantum_status_text())
+        elif cmd == "selftest":
+            print(quantum_selftest_text())
+        elif cmd == "calibrate":
+            try:
+                print(quantum_calibrate_now())
+            except Exception as e:
+                print(f"calibrate unavailable: {e}")
+        elif cmd == "backtest":
+            if len(args) < 2:
+                print("usage: backtest FILE [SYMBOL]")
+                return 2
+            print(quantum_backtest_csv(args[1], args[2] if len(args) > 2 else "XAUUSD"))
+        elif cmd == "report":
+            print(quantum_live_status_report())
+        elif cmd == "leaderboard":
+            for r in l2_leaderboard():
+                print(r)
+        elif cmd == "importance":
+            for k, v in quantum_global_importance().items():
+                print(f"{k}: {v}")
+        elif cmd == "autopsy":
+            print(quantum_autopsy2_report())
+        elif cmd == "spec":
+            s = quantum_spec(args[1] if len(args) > 1 else "XAUUSD")
+            for k, v in s.as_dict().items():
+                print(f"{k}: {v}")
+        elif cmd == "version":
+            print(quantum_version())
+            print(quantum_changelog_tail(15))
+        else:
+            print(f"unknown command: {cmd}\n{QUANTUM_CLI_HELP}")
+            return 2
+        return 0
+    except Exception as e:
+        print(f"CLI error: {e}")
+        return 1
+
+
+def quantum_backtest_csv(path, symbol="XAUUSD", **kw):
+    """CSV backtest driver: time,open,high,low,close[,tickvol] -> HTML + summary."""
+    try:
+        import csv as _csv
+        rows = []
+        with open(path, newline="") as f:
+            rd = _csv.DictReader(f)
+            for r in rd:
+                try:
+                    rows.append({"time": r.get("time", r.get("date", "")),
+                                 "open": float(r["open"]), "high": float(r["high"]),
+                                 "low": float(r["low"]), "close": float(r["close"]),
+                                 "tickvol": float(r.get("tickvol", r.get("volume", 0)) or 0)})
+                except Exception:
+                    continue
+        if len(rows) < 150:
+            return f"not enough rows ({len(rows)} < 150)"
+        return quantum_backtest_rows(rows, symbol, **kw)
+    except Exception as e:
+        return f"backtest error: {e}"
+
+
+def quantum_backtest_rows(rows, symbol="XAUUSD", start_frac=0.25, risk_r=1.0,
+                          spread_est=None, report_path="quantum_report.html"):
+    """Event-loop backtest over row dicts. No lookahead: decisions use only
+    bars strictly before the entry bar; exits evaluated on subsequent bars."""
+    try:
+        n = len(rows)
+        start = int(n * start_frac)
+        closes = [r["close"] for r in rows]
+        # Spread estimate: 35th pct of (high-low) if not given (conservative)
+        if spread_est is None:
+            rngs = sorted(r["high"] - r["low"] for r in rows[:start] or rows)
+            spread_est = rngs[int(len(rngs) * 0.35)] * 0.08 if rngs else 0.0
+        try:
+            spec = quantum_spec(symbol)
+        except Exception:
+            spec = None
+        trades = []
+        equity = [0.0]
+        pos = None  # {side, entry, sl, tp, t_stop, entry_i, strategy, regime, r}
+        i = start
+        while i < n:
+            r = rows[i]
+            px_o, px_h, px_l, px_c = r["open"], r["high"], r["low"], r["close"]
+            if pos is not None:
+                # Exit check on this bar (conservative: SL first)
+                ex = None
+                if pos["side"] > 0:
+                    if px_l <= pos["sl"]:
+                        ex = pos["sl"]
+                    elif px_h >= pos["tp"]:
+                        ex = pos["tp"]
+                else:
+                    if px_h >= pos["sl"]:
+                        ex = pos["sl"]
+                    elif px_l <= pos["tp"]:
+                        ex = pos["tp"]
+                if ex is None and i - pos["entry_i"] >= pos["t_stop"]:
+                    ex = px_c
+                if ex is not None:
+                    risk = abs(pos["entry"] - pos["sl"]) or 1e-9
+                    pnl_r = (ex - pos["entry"]) * pos["side"] / risk
+                    pnl_r -= spread_est / risk  # costs
+                    trades.append({"r": round(pnl_r, 3), "pnl": round(pnl_r * risk_r, 2),
+                                   "side": pos["side"], "strategy": pos["strategy"],
+                                   "regime": pos["regime"], "entry_t": rows[pos["entry_i"]]["time"],
+                                   "exit_t": r["time"]})
+                    equity.append(equity[-1] + pnl_r * risk_r)
+                    try:
+                        l2_record(pos["strategy"], pnl_r)
+                    except Exception:
+                        pass
+                    pos = None
+                    i += 1
+                    continue
+            # Entry decision: history window strictly before bar i
+            win = rows[max(0, i - 400):i]
+            if len(win) < 120:
+                equity.append(equity[-1])
+                i += 1
+                continue
+            df = {k: [w[k] for w in win] for k in ("open", "high", "low", "close", "tickvol")}
+            try:
+                reg = quantum_regime(df)
+                regime = reg.get("regime", "RANGE") if isinstance(reg, dict) else "RANGE"
+            except Exception:
+                regime = "RANGE"
+            try:
+                early = quantum_early(df, tick={"spread": spread_est})
+                if isinstance(early, dict) and not early.get("pass", True):
+                    equity.append(equity[-1])
+                    i += 1
+                    continue
+            except Exception:
+                pass
+            ctx = {"df": df, "htf_df": None, "regime": regime,
+                   "session": "OVERLAP", "spread": spread_est,
+                   "open_risk_r": 0.0 if pos is None else 1.0}
+            try:
+                route = l2_route(ctx)
+            except Exception:
+                route = {}
+            sigs = route.get("signals", []) if isinstance(route, dict) else []
+            if route.get("veto") or not sigs:
+                equity.append(equity[-1])
+                i += 1
+                continue
+            s = sigs[0]
+            if abs(s.get("side", 0)) != 1 or s.get("conf", 0) < 0.5:
+                equity.append(equity[-1])
+                i += 1
+                continue
+            # Size the trade: ATR from window
+            try:
+                atrs = q_atr_from_lists(df["high"], df["low"], df["close"], 14)
+                a = atrs[-1] if atrs else (px_h - px_l or 1e-9)
+            except Exception:
+                a = px_h - px_l or 1e-9
+            entry = px_o  # next-bar-open convention
+            side = s["side"]
+            sl = entry - side * s.get("sl_atr", 2.0) * a
+            tp = entry + side * s.get("tp_atr", 3.0) * a
+            try:
+                qe = quantum_exits(s.get("strategy", "generic"), a, side)
+                sl = entry - side * qe.get("sl_atr", s.get("sl_atr", 2.0))
+                tp = entry + side * qe.get("tp_atr", s.get("tp_atr", 3.0))
+                t_stop = int(qe.get("time_stop_bars", 48))
+            except Exception:
+                t_stop = 48
+            pos = {"side": side, "entry": entry, "sl": sl, "tp": tp,
+                   "t_stop": t_stop, "entry_i": i,
+                   "strategy": s.get("strategy", "?"), "regime": regime}
+            equity.append(equity[-1])
+            i += 1
+        out = quantum_backtest_report(trades, equity, path=report_path,
+                                      title=f"Quantum Backtest — {symbol}")
+        rs = [t["r"] for t in trades]
+        summ = (f"{symbol}: n={len(trades)} netR={sum(rs):+.1f} "
+                f"ev={(sum(rs)/len(rs)) if rs else 0:+.3f} report={out}")
+        return summ
+    except Exception as e:
+        return f"backtest error: {e}"
+
+
+# ----------------------------------------------------------------------------
+# PROLOGUE — version, changelog, architecture map, runbook
+# ----------------------------------------------------------------------------
+
+QUANTUM_VERSION = "13.0-quantum"
+QUANTUM_CODENAME = "Moonlight Prime"
+QUANTUM_CHANGELOG = [
+    ("13.0", "Quantum Core complete: E0-E7 brain, F1-F5 features, L2 strategies, "
+             "G/G2 validation+exits, O indicators, I execution, J portfolio, "
+             "K journal, L adapters, M diagnostics, R/T reports+specs, Q CLI."),
+    ("12.1", "v12.1 fix baseline: guardrails, kill-switches, 83-col telemetry "
+             "(preserved verbatim below the quantum line)."),
+    ("12.0", "Original myxauusdbot framework (reference only)."),
+]
+
+
+def quantum_version():
+    return f"Sentinel {QUANTUM_VERSION} '{QUANTUM_CODENAME}'"
+
+
+def quantum_changelog_tail(n=15):
+    try:
+        return "\n".join(f"{v}: {t}" for v, t in QUANTUM_CHANGELOG[:n])
+    except Exception:
+        return ""
+
+
+QUANTUM_ARCHITECTURE = """Sentinel Quantum Core — architecture map
+=================================================
+DATA     I: tick cache, resilient fetch, spread log      (I1-I4)
+FEATURES F1 Pine parity  F2 structure  F3 ICT/gang  F4 patterns
+         F5 20 adaptive systems  O adaptive indicators  O2 microstructure
+BRAIN    E0 outcomes  E1 decisions  E2 mining  E3 evolution  E4 feedback
+         E5 calibrated ensemble + bandit  E6 narrative/pre-flight/seasonal
+         E7 walk-forward + pinball/TAC + conformal
+REGIME   H: HMM, change-points, Hurst, MTFA, chaos, stress, sessions
+VALIDATE G: deflated Sharpe, Monte Carlo, SPA, harvest scheduler
+         G2: attribution forensics, autopsy clusters, conformal exits/trails
+TRADE    L2 9 adaptive strategies -> quantum junction -> E5 decide
+         J portfolio brain (netting, corr cap, DD governor)
+         Q exits (conformal SL/TP/time) + smart placer + slip guard
+LEARN    K journal/digest  M selftest/status  R tearsheets  Q CLI
+LEGACY   L adapters (9 v12 strategies groomed, parked by default)
+""".strip()
+
+
+def quantum_architecture():
+    return QUANTUM_ARCHITECTURE
+
+
+QUANTUM_RUNBOOK = """Sentinel Quantum Runbook (operator quick-start)
+=====================================================
+1. CREDENTIALS: set env (MT5_LOGIN/MT5_PASSWORD/MT5_SERVER, TG_*, GMAIL_*,
+   GEMINI_API_KEY, NEWS_API_KEY) — never hardcode (Moonlight build excepted).
+2. SMOKE: python -c "import sentinel_bot"  (or CLI: selftest)
+3. BACKTEST: CLI 'backtest XAUUSDm_M15.csv XAUUSDm' -> quantum_report.html
+4. CALIBRATE: run 500+ paper bars, then CLI 'calibrate'; check TAC<0.08.
+5. GO LIVE: enable trading; watch 'status' + quantum_live_status.html.
+6. HARVEST: monthly — SPA gate promotes challengers; parked L2 strategies
+   need 20+ paper trades with expectancy>0 to return.
+7. KILL: daily -4R or DD governor veto stops new entries automatically.
+8. FORENSICS: after red weeks read autopsy + attribution importance.
+RISK: 1R default; vol governor caps lots at 25% vol target; news blackouts
+are per-class adaptive. Past fills do not guarantee future fills.
+""".strip()
+
+
+def quantum_runbook():
+    return QUANTUM_RUNBOOK
+
+
+SECTION_QRT_OK = True
