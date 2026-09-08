@@ -21,3 +21,13 @@ checkpoints/
 state/
 *.db
 *.db-journal
+
+# quantum lab artifacts
+quantum_store/
+quantum_report.html
+quantum_live_status.html
+quantum_lab.html
+quantum_trades.csv
+quantum_trades.json
+quantum_weekly.txt
+quantum_profile.json

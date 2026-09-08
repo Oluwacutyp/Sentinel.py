@@ -25241,11 +25241,19 @@ class EarlyAnalysisGate:
             else:
                 pct = 0.5
             verdict["spread_pctile"] = float(pct)
+            # Cluster-top guard: percentile 1.0 at the top of a TIGHT cluster
+            # (fixed spreads, backtest estimates) is not an anomaly. Require
+            # the spread to also be absolutely wide vs its own median.
+            try:
+                _p50 = float(self.spread.quantile(0.5) or 0.0)
+                _ratio = float(spr) / _p50 if _p50 > 1e-12 else 1.0
+            except Exception:
+                _ratio = 2.0
             cap = float(_qcfg("quantum_spread_max_pctile", 0.80))
-            if pct >= 0.97:
+            if pct >= 0.97 and _ratio > 3.0:
                 verdict["hard_holds"].append(f"spread p{int(pct * 100)}>=97 (extreme)")
                 verdict["gates"]["spread"] = {"pass": False, "detail": f"extreme p{int(pct * 100)}"}
-            elif pct >= cap:
+            elif pct >= cap and _ratio > 1.5:
                 verdict["soft_holds"].append(f"spread p{int(pct * 100)}>={int(cap * 100)}")
                 verdict["size_mult"] *= 0.5
                 verdict["gates"]["spread"] = {"pass": True, "soft": True, "detail": f"wide p{int(pct * 100)}"}
@@ -35087,7 +35095,15 @@ def quantum_parity(csv_paths, symbol="XAUUSD"):
                 continue
             df = {k: [w[k] for w in rows[-400:]] for k in
                   ("open", "high", "low", "close", "tickvol")}
+            try:
+                _FUSE_SINGLETON["obj"] = SignalFuse()
+            except Exception:
+                pass
             t1 = quantum_signal({"M15": df}, {}, symbol=symbol, bar_no=1)
+            try:
+                _FUSE_SINGLETON["obj"] = SignalFuse()
+            except Exception:
+                pass
             t2 = quantum_signal({"M15": df}, {}, symbol=symbol, bar_no=9999)
             d1 = t1.as_dict() if isinstance(t1, EntryTicket) else {}
             d2 = t2.as_dict() if isinstance(t2, EntryTicket) else {}
