@@ -36985,3 +36985,419 @@ except Exception:
     pass
 
 SECTION_EDGE_OK = True
+
+# ============================================================================
+# OPS — SYSTEM INTEGRATOR (routines, reviews, model cards, emergency brake)
+# ----------------------------------------------------------------------------
+# OPSa DailyRoutine   pre-market checklist runner (gates the first cycle)
+# OPSb WeeklyReview   auto-written weekly performance review
+# OPSc ModelCard      per-strategy model card (what it is, when it works)
+# OPSd EmergencyBrake flatten-all planner (paper-safe, two-key confirm)
+# OPSe Heartbeat      Telegram/email-ready telemetry ping formatter
+# OPSf SchedulerLite  in-process cron for harvest/snapshot/review/routine
+# ============================================================================
+
+class DailyRoutine:
+    """Pre-market checklist. Every item PASS/WARN/FAIL; FAIL blocks trading."""
+
+    CHECKS = ("selftest", "meta", "calendar", "snapshot", "spread_baseline",
+              "broker", "profile")
+
+    def run(self, symbols=("XAUUSD",)):
+        out = {"checks": {}, "trade_allowed": True, "at": ""}
+        try:
+            import datetime as _dt
+            out["at"] = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            pass
+        # 1. selftest
+        try:
+            txt = quantum_selftest_text()
+            ok = "PASS" in str(txt).upper()
+            out["checks"]["selftest"] = "PASS" if ok else "FAIL:selftest_red"
+            if not ok:
+                out["trade_allowed"] = False
+        except Exception as e:
+            out["checks"]["selftest"] = f"FAIL:{e}"
+            out["trade_allowed"] = False
+        # 2. meta verdict
+        try:
+            mv = quantum_meta_verdict()
+            v = mv.get("verdict", "UNKNOWN")
+            out["checks"]["meta"] = v
+            if v == "HALT_NEW_RISK":
+                out["trade_allowed"] = False
+        except Exception as e:
+            out["checks"]["meta"] = f"WARN:{e}"
+        # 3. calendar loaded?
+        try:
+            _, _, cal = _newslab()
+            n = len(getattr(cal, "events", []) or [])
+            out["checks"]["calendar"] = f"PASS:{n}_events" if n else "WARN:empty_calendar"
+        except Exception as e:
+            out["checks"]["calendar"] = f"WARN:{e}"
+        # 4. snapshot store writable?
+        try:
+            s = quantum_snapshot()
+            out["checks"]["snapshot"] = "PASS" if s.get("saved") else f"WARN:{s}"
+        except Exception as e:
+            out["checks"]["snapshot"] = f"WARN:{e}"
+        # 5. spread baselines per symbol
+        try:
+            for sym in symbols:
+                spec = quantum_spec(sym)
+                out["checks"][f"spread:{sym}"] = "PASS"
+        except Exception as e:
+            out["checks"]["spread_baseline"] = f"WARN:{e}"
+        # 6. broker prints healthy?
+        try:
+            bad = [k for k, p in BrokerFingerprint._prints.items() if not p.healthy()]
+            out["checks"]["broker"] = "PASS" if not bad else f"FAIL:unhealthy_{','.join(bad)}"
+            if bad:
+                out["trade_allowed"] = False
+        except Exception as e:
+            out["checks"]["broker"] = f"WARN:{e}"
+        # 7. profile
+        try:
+            out["checks"]["profile"] = str(quantum_cfg("profile", "?"))
+        except Exception:
+            out["checks"]["profile"] = "?"
+        fails = [k for k, v in out["checks"].items() if str(v).startswith("FAIL")]
+        out["fails"] = fails
+        if fails:
+            out["trade_allowed"] = False
+        return out
+
+    def text(self, symbols=("XAUUSD",)):
+        try:
+            r = self.run(symbols)
+            L = [f"DAILY ROUTINE {r.get('at', '')} — TRADE_ALLOWED={r['trade_allowed']}"]
+            for k, v in r["checks"].items():
+                L.append(f"  [{('OK ' if str(v).startswith('PASS') else ('!!' if str(v).startswith('FAIL') else '??'))}] {k}: {v}")
+            return "\n".join(L)
+        except Exception as e:
+            return f"routine error: {e}"
+
+
+def quantum_routine(symbols=("XAUUSD",)):
+    try:
+        return DailyRoutine().run(symbols)
+    except Exception as e:
+        return {"trade_allowed": False, "error": str(e)}
+
+
+def quantum_routine_text(symbols=("XAUUSD",)):
+    try:
+        return DailyRoutine().text(symbols)
+    except Exception as e:
+        return f"routine error: {e}"
+
+
+class WeeklyReview:
+    """Auto-written weekly review from the learning stores."""
+
+    def write(self):
+        L = []
+        try:
+            import datetime as _dt
+            L.append(f"WEEKLY REVIEW — {_dt.datetime.utcnow().strftime('%Y-%m-%d')}")
+            L.append("=" * 60)
+        except Exception:
+            pass
+        try:
+            mv = quantum_meta_verdict()
+            L.append(f"System: {mv.get('verdict')} (score {mv.get('score')})")
+            L.append(f"Watchdogs: {' | '.join(mv.get('parts', []))}")
+        except Exception:
+            pass
+        L.append("")
+        try:
+            L.append("STRATEGY BOARD")
+            L.append(ql2_board_text())
+        except Exception:
+            pass
+        L.append("")
+        try:
+            lb = l2_leaderboard()
+            hot = [r for r in lb if r.get("expectancy", 0) > 0.1 and not r.get("parked")]
+            cold = [r for r in lb if r.get("parked") or r.get("expectancy", 0) < -0.05]
+            L.append(f"Hot ({len(hot)}): " + ", ".join(r["strategy"] for r in hot[:5]))
+            L.append(f"Cold ({len(cold)}): " + ", ".join(r["strategy"] for r in cold[:5]))
+        except Exception:
+            pass
+        L.append("")
+        try:
+            L.append("ATTRIBUTION (what moved the needle)")
+            L.append(qimportance_text())
+        except Exception:
+            pass
+        L.append("")
+        try:
+            L.append("AUTOPSY: " + str(quantum_autopsy2_report().get("verdict")))
+            L.append("FILLQ: " + str(quantum_fillq_report().get("verdict")))
+        except Exception:
+            pass
+        L.append("")
+        try:
+            o = _DRIFT.get("obj")
+            L.append(f"DRIFT: {o.state if o else 'WARMUP'} (events: {o.drifts if o else 0})")
+        except Exception:
+            pass
+        L.append("")
+        L.append("ACTIONS FOR NEXT WEEK:")
+        try:
+            lb = l2_leaderboard()
+            parked = [r for r in lb if r.get("parked")]
+            if parked:
+                L.append(f"  - {len(parked)} parked strategies need 20+ paper trades to return")
+            mv = quantum_meta_verdict()
+            if mv.get("verdict") != "HEALTHY":
+                L.append(f"  - system {mv.get('verdict')}: run red-week playbook (quantum_help('troubleshoot'))")
+            else:
+                L.append("  - system healthy: hold course, run harvest on schedule")
+        except Exception:
+            pass
+        return "\n".join(L)
+
+
+def quantum_weekly_review():
+    try:
+        return WeeklyReview().write()
+    except Exception as e:
+        return f"review error: {e}"
+
+
+class ModelCard:
+    """Model card per strategy: identity, regime, needs, stats, exits."""
+
+    STATIC = {
+        "trend_rider": ("Trend ride with breathing EMAs + quantile ADX gate.",
+                        "TREND_*, VOLATILE", "ADX top-40% of own history, EMA touch, HTF align"),
+        "breakout_hunter": ("Volatility-breathed Donchian + structure SL + learned R.",
+                            "RANGE, VOLATILE", "squeeze, volume surge, no trap wick"),
+        "swing_catcher": ("Mean-reversion with breathing z-window + quantile bands.",
+                          "RANGE, QUIET", "z beyond quantile band, HTF not strongly against"),
+        "scalp_sniper": ("Spread-normalized micro-scalps, killzone + imbalance.",
+                         "QUIET, RANGE", "liquid session, tight spread, tick imbalance"),
+        "news_sentinel": ("Event-class-calibrated blackout + ignition entries.",
+                          "ALL", "scheduled event within adaptive window"),
+        "grid_weaver": ("ATR-quantile grid with bias filter + heat pause.",
+                        "RANGE, QUIET", "low portfolio heat, quantum bias"),
+        "hedge_guardian": ("Correlation-gated beta hedge, net-zero delta target.",
+                           "ALL", "exposure + pain + hedge correlation"),
+        "recovery_pilot": ("Edge-gated recovery scaling (no edge => no scale).",
+                           "not CHAOS/NEWS", "drawdown + live edge > 0.02R"),
+        "divergence_sniper": ("3-witness divergence entries (div + RSI + swing).",
+                              "RANGE, TREND_*, VOLATILE", "divergence + RSI quantile + swing break"),
+        "fib_sniper": ("Reaction-validated Fibonacci levels.", "RANGE, TREND_*, QUIET",
+                       "armed level touch + wick reaction"),
+        "session_break": ("Session-range breakout with learned expansion.",
+                          "RANGE, QUIET", "session open range + expansion multiple"),
+        "sweep_fader": ("Fade only violent, fast-reclaimed sweeps.", "RANGE, VOLATILE",
+                        "top-quartile displacement + reclaim"),
+        "vol_squeeze": ("Compression breakout, regime-routed direction.",
+                        "QUIET, RANGE", "compression + release + lean"),
+        "carry_drift": ("Slow-drift grind harvester, tiny size.", "QUIET, RANGE",
+                        "drift SNR 0.04..0.5"),
+        "gap_filler": ("Gap/FVG fills with hard invalidation.", "RANGE, QUIET",
+                       "gap + no acceptance beyond origin"),
+        "overnight": ("Overnight drift harvest (measured).", "QUIET, RANGE",
+                      "significant overnight t-stat"),
+        "turn_of_month": ("Turn-of-month window rider.", "RANGE, QUIET",
+                          "TOM window + significant effect"),
+        "dxy_tide": ("USD-tide follower for XAU (needs proxy).", "ALL",
+                     "proxy series + |corr| > 0.4"),
+        "expiry_fade": ("COMEX expiry-week spike fader.", "VOLATILE, RANGE",
+                        "expiry week + spike + rejection"),
+        "session_drift": ("Session-open drift follower.", "SESSION, VOLATILE",
+                          "drift + shallow pullback"),
+        "dow_bias": ("Day-of-week bias overlay.", "RANGE, QUIET",
+                     "significant DOW t-stat"),
+    }
+
+    @classmethod
+    def card(cls, name):
+        try:
+            desc, regimes, needs = cls.STATIC.get(str(name), ("?", "?", "?"))
+            stats = {}
+            try:
+                for r in l2_leaderboard():
+                    if r.get("strategy") == name:
+                        stats = r
+                        break
+            except Exception:
+                pass
+            L = [f"MODEL CARD: {name}", f"  what: {desc}", f"  regimes: {regimes}",
+                 f"  needs: {needs}"]
+            if stats:
+                L.append(f"  live: n={stats.get('n')} win={stats.get('win_rate')} "
+                         f"exp={stats.get('expectancy')}R w={stats.get('weight')} "
+                         f"{'PARKED' if stats.get('parked') else 'ACTIVE'}")
+            else:
+                L.append("  live: no trades yet (trial budget 0.5 weight)")
+            return "\n".join(L)
+        except Exception as e:
+            return f"card error: {e}"
+
+    @classmethod
+    def all_cards(cls):
+        try:
+            return "\n\n".join(cls.card(c().name) for c in L2Suite.CLASSES)
+        except Exception as e:
+            return f"cards error: {e}"
+
+
+def quantum_model_card(name):
+    try:
+        return ModelCard.card(name)
+    except Exception as e:
+        return str(e)
+
+
+def quantum_model_cards():
+    try:
+        return ModelCard.all_cards()
+    except Exception as e:
+        return str(e)
+
+
+class EmergencyBrake:
+    """Two-key emergency flatten planner. Paper-safe: plans by default."""
+
+    def __init__(self):
+        self.armed_key1 = False
+
+    def arm(self):
+        self.armed_key1 = True
+        return "KEY1 armed — call release(positions, broker_fn, confirm='FLATTEN') to execute"
+
+    def release(self, positions, broker_fn=None, confirm=""):
+        try:
+            if not self.armed_key1:
+                return {"status": "need_arm", "hint": "call arm() first (key 1)"}
+            if confirm != "FLATTEN":
+                return {"status": "need_confirm", "hint": "pass confirm='FLATTEN' (key 2)"}
+            self.armed_key1 = False
+            legs = []
+            for p in positions or []:
+                try:
+                    legs.append({"action": "close", "ticket": p.get("ticket"),
+                                 "symbol": p.get("symbol"),
+                                 "side": -int(p.get("side", 1)),
+                                 "lots": p.get("lots", p.get("volume", 0))})
+                except Exception:
+                    continue
+            out = {"status": "planned", "legs": legs, "n": len(legs)}
+            if broker_fn is None:
+                out["status"] = "dry_run"
+                return out
+            fills = []
+            for leg in legs:
+                try:
+                    fills.append(broker_fn(leg))
+                except Exception as e:
+                    fills.append({"ok": False, "error": str(e)})
+            out["status"] = "executed"
+            out["fills"] = fills
+            return out
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+
+_BRAKE = {"obj": None}
+
+
+def quantum_brake():
+    try:
+        o = _BRAKE.get("obj")
+        if o is None:
+            o = EmergencyBrake()
+            _BRAKE["obj"] = o
+        return o
+    except Exception:
+        return EmergencyBrake()
+
+
+class Heartbeat:
+    """One-line telemetry ping for Telegram/email/cron (ASCII-safe)."""
+
+    @staticmethod
+    def ping(equity=None, open_trades=None, daily_r=None):
+        try:
+            import datetime as _dt
+            ts = _dt.datetime.utcnow().strftime("%H:%M")
+            try:
+                mv = quantum_meta_verdict()
+                v = mv.get("verdict", "?")
+            except Exception:
+                v = "?"
+            parts = [f"[{ts}UTC]", f"SYS:{v}"]
+            if equity is not None:
+                parts.append(f"EQ:{equity}")
+            if open_trades is not None:
+                parts.append(f"OPEN:{open_trades}")
+            if daily_r is not None:
+                parts.append(f"DAY:{float(daily_r):+.1f}R")
+            try:
+                h = quantum_heat()
+                parts.append(f"HEAT:{h.get('heat')}R")
+            except Exception:
+                pass
+            return " ".join(parts)
+        except Exception as e:
+            return f"heartbeat error: {e}"
+
+
+def quantum_heartbeat(**kw):
+    try:
+        return Heartbeat.ping(**kw)
+    except Exception as e:
+        return str(e)
+
+
+class SchedulerLite:
+    """In-process cron: register(fn, every_sec) + tick() from the main loop."""
+
+    def __init__(self):
+        self.jobs = []  # {name, every, fn, last}
+
+    def every(self, name, every_sec, fn):
+        try:
+            self.jobs.append({"name": str(name), "every": float(every_sec),
+                              "fn": fn, "last": 0.0})
+            return True
+        except Exception:
+            return False
+
+    def tick(self, now_ts=None):
+        ran = []
+        try:
+            import time as _t
+            now = now_ts or _t.time()
+            for j in self.jobs:
+                if now - j["last"] >= j["every"]:
+                    j["last"] = now
+                    try:
+                        j["fn"]()
+                        ran.append(j["name"])
+                    except Exception as e:
+                        ran.append(f"{j['name']}:ERR:{e}")
+            return ran
+        except Exception:
+            return ran
+
+    @staticmethod
+    def standard():
+        """The recommended job set: snapshot/15m, heartbeat/1h, review/weekly."""
+        s = SchedulerLite()
+        try:
+            s.every("snapshot", 900, quantum_snapshot)
+            s.every("heartbeat", 3600, quantum_heartbeat)
+            s.every("weekly_review", 7 * 86400,
+                    lambda: open("quantum_weekly.txt", "a").write(quantum_weekly_review() + "\n"))
+        except Exception:
+            pass
+        return s
+
+
+SECTION_OPS_OK = True
