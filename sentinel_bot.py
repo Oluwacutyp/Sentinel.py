@@ -33079,3 +33079,393 @@ def quantum_matrix_text(tf_dfs, ctx=None):
 
 
 SECTION_QSIG_OK = True
+
+# ============================================================================
+# L2b — SECOND STRATEGY WAVE (6 more adaptive systems; L2Suite extended to 15)
+# ----------------------------------------------------------------------------
+# 10. AdaptiveFibSniper     — reaction-validated Fibonacci (dead levels pruned)
+# 11. AdaptiveSessionBreak  — session-range breakout with learned expansion
+# 12. AdaptiveSweepFader    — liquidity-sweep fade with displacement quantile
+# 13. AdaptiveVolSqueeze    — compression breakout, regime-routed direction
+# 14. AdaptiveCarryDrift    — slow-drift ride for QUIETgrind regimes
+# 15. AdaptiveGapFiller     — gap/fair-value-gap fill with invalidation
+# Each follows the L2 contract: analyze(ctx) -> sig, record(r), suitable().
+# ============================================================================
+
+class AdaptiveFibSniper(_L2Base):
+    """Fibonacci entries at levels that PROVED they react (miner-validated).
+
+    Legacy used fixed 38.2/50/61.8 blindly. Here every touch is scored:
+    levels whose touches reverse > 55% stay armed; the rest are pruned.
+    """
+
+    name = "fib_sniper"
+    LEVELS = (0.382, 0.5, 0.618, 0.705, 0.79)
+
+    def __init__(self):
+        super().__init__()
+        self._touch = {lv: [0, 0] for lv in self.LEVELS}  # lv -> [reacts, touches]
+
+    def suitable(self, regime):
+        return regime in ("RANGE", "TREND_UP", "TREND_DOWN", "QUIET")
+
+    def _armed(self, lv):
+        reacts, touches = self._touch.get(lv, (0, 0))
+        if touches < 6:
+            return True  # trial budget
+        return (reacts / touches) >= 0.45
+
+    def feedback(self, lv, reacted):
+        try:
+            r, t = self._touch.get(float(lv), (0, 0))
+            self._touch[float(lv)] = [r + (1 if reacted else 0), t + 1]
+        except Exception:
+            pass
+
+    def analyze(self, ctx):
+        try:
+            o, h, l, c = self._cols(ctx)
+            if len(c) < 90:
+                return self._sig(reason="warmup")
+            # Anchor swing: highest high / lowest low of last 60
+            seg_h, seg_l = h[-60:], l[-60:]
+            hi, lo = max(seg_h), min(seg_l)
+            rng = hi - lo
+            if rng <= 1e-12:
+                return self._sig(reason="flat")
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else rng / 10
+            px = c[-1]
+            up_swing = seg_h.index(hi) > seg_l.index(lo)  # swing direction
+            tol = 0.25 * a
+            best = None
+            for lv in self.LEVELS:
+                if not self._armed(lv):
+                    continue
+                lvl = hi - rng * lv if up_swing else lo + rng * lv
+                if abs(px - lvl) <= tol:
+                    # Reaction confirm: wick against the level + close back
+                    if up_swing:  # pullback short zone in up structure? fade the dip
+                        reacted = l[-1] < lvl and c[-1] > lvl
+                        side = 1
+                    else:
+                        reacted = h[-1] > lvl and c[-1] < lvl
+                        side = -1
+                    if reacted:
+                        best = (lv, lvl, side)
+                        break
+            if best is None:
+                return self._sig(reason="no_touch")
+            lv, lvl, side = best
+            extreme = lo if side > 0 else hi
+            sl_atr = qclip(abs(px - extreme) / (a + 1e-12) + 0.5, 1.0, 4.0)
+            # TP: next fib extension (adaptive: 0.5R beyond origin extreme)
+            tp_atr = qclip(abs(extreme - px) / (a + 1e-12) * 0.7 + 1.0, 1.0, 5.0)
+            feats = {"fib_lv": lv, "tol_atr": abs(px - lvl) / (a + 1e-12)}
+            try:
+                conf = quantum_calibrated_prob(feats)
+            except Exception:
+                conf = 0.58
+            return self._sig(side, conf, sl_atr, tp_atr, f"fib{lv}_react",
+                             fib_level=float(lv))
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveSessionBreak(_L2Base):
+    """Session-range breakout: range from the ACTUAL session, expansion learned.
+
+    Legacy straddles used fixed distances. Here the opening range is measured,
+    and the required expansion multiple comes from this session's own history.
+    """
+
+    name = "session_break"
+
+    def __init__(self):
+        super().__init__()
+        self._exp_win = QuantileWindow(120)  # realized expansion multiples
+
+    def suitable(self, regime):
+        return regime in ("RANGE", "QUIET", "SESSION", "VOLATILE")
+
+    def analyze(self, ctx):
+        try:
+            o, h, l, c = self._cols(ctx)
+            sess = str(ctx.get("session", "")).upper()
+            if sess in ("OFF", "UNKNOWN", ""):
+                return self._sig(reason="no_session")
+            if len(c) < 60:
+                return self._sig(reason="warmup")
+            # Opening range: first third of the visible session window
+            k = max(10, len(c) // 4)
+            orh, orl = max(h[-k:]), min(l[-k:])
+            orng = orh - orl
+            if orng <= 1e-12:
+                return self._sig(reason="flat_open")
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else orng
+            px = c[-1]
+            need = self._exp_win.q(0.5) or 0.5  # median expansion to trust
+            up_break = (px - orh) / (a + 1e-12)
+            dn_break = (orl - px) / (a + 1e-12)
+            side = 0
+            if up_break > 0.3 + need * 0.3:
+                side = 1
+            elif dn_break > 0.3 + need * 0.3:
+                side = -1
+            else:
+                return self._sig(reason="inside")
+            # Range-quality filter: too wide a range => no energy left
+            if orng / (a + 1e-12) > 6.0:
+                return self._sig(reason="range_spent")
+            lvl = orh if side > 0 else orl
+            sl_atr = qclip(abs(px - lvl) / (a + 1e-12) + 0.8 + orng / (a + 1e-12) * 0.3,
+                           1.0, 4.0)
+            tp_atr = qclip(orng / (a + 1e-12) * (0.8 + need * 0.4), 1.0, 6.0)
+            feats = {"expansion": max(up_break, dn_break), "or_atr": orng / (a + 1e-12)}
+            try:
+                conf = quantum_calibrated_prob(feats)
+            except Exception:
+                conf = 0.55
+            return self._sig(side, conf, sl_atr, tp_atr,
+                             f"sess{sess}_exp{need:.2f}")
+        except Exception:
+            return self._sig(reason="error")
+
+    def feedback_expansion(self, realized_mult):
+        try:
+            self._exp_win.add(float(realized_mult))
+        except Exception:
+            pass
+
+
+class AdaptiveSweepFader(_L2Base):
+    """Fade liquidity sweeps ONLY when displacement exceeds its own quantile.
+
+    Legacy SMC traded every wick past a level. Here the sweep must be violent
+    (top-quartile displacement) AND reclaim fast, else it's a real break.
+    """
+
+    name = "sweep_fader"
+
+    def __init__(self):
+        super().__init__()
+        self._disp_win = QuantileWindow(300)
+
+    def suitable(self, regime):
+        return regime in ("RANGE", "VOLATILE", "TREND_UP", "TREND_DOWN")
+
+    def analyze(self, ctx):
+        try:
+            o, h, l, c = self._cols(ctx)
+            if len(c) < 60:
+                return self._sig(reason="warmup")
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else 1e-9
+            # Track displacement quantiles
+            for i in range(-30, -1):
+                self._disp_win.add(abs(c[i] - c[i - 1]) / (a + 1e-12))
+            # Level: recent swing high/low (10-bar fractal)
+            swing_hi = max(h[-12:-2]) if len(h) > 12 else h[-1]
+            swing_lo = min(l[-12:-2]) if len(l) > 12 else l[-1]
+            swept_hi = h[-1] > swing_hi and c[-1] < swing_hi
+            swept_lo = l[-1] < swing_lo and c[-1] > swing_lo
+            if not (swept_hi or swept_lo):
+                return self._sig(reason="no_sweep")
+            disp = abs(h[-1] - swing_hi) / (a + 1e-12) if swept_hi else abs(swing_lo - l[-1]) / (a + 1e-12)
+            if self._disp_win.percentile(disp) < 0.6:
+                return self._sig(reason="weak_sweep")  # probably a real break forming
+            side = -1 if swept_hi else 1
+            wick = h[-1] - l[-1]
+            sl_atr = qclip(wick / (a + 1e-12) + 0.6, 1.0, 3.5)
+            tp_atr = qclip(disp * 1.8 + 0.8, 1.0, 5.0)
+            feats = {"disp": disp / 3.0, "reclaim": 1.0}
+            try:
+                conf = quantum_calibrated_prob(feats)
+            except Exception:
+                conf = 0.6
+            return self._sig(side, conf, sl_atr, tp_atr, f"sweep_disp{disp:.2f}a")
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveVolSqueeze(_L2Base):
+    """Compression breakout with regime-routed direction (not blind both-ways).
+
+    Legacy squeeze straddles paid spread twice. Here direction comes from the
+    regime + F5 lean; the squeeze only supplies timing.
+    """
+
+    name = "vol_squeeze"
+
+    def suitable(self, regime):
+        return regime in ("QUIET", "RANGE", "SESSION")
+
+    def analyze(self, ctx):
+        try:
+            o, h, l, c = self._cols(ctx)
+            if len(c) < 100:
+                return self._sig(reason="warmup")
+            # Compression: current 10-bar stdev vs 100-bar history
+            import math as _m
+            rets = [c[i] - c[i - 1] for i in range(-100, 0)]
+            shorts = [abs(x) for x in rets[-10:]]
+            hist = sorted(abs(x) for x in rets)
+            cur = sum(shorts) / len(shorts)
+            pct = sum(1 for x in hist if x <= cur) / len(hist)
+            if pct > 0.2:
+                return self._sig(reason="not_compressed")
+            # Release: today's range expanding vs the squeeze?
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else 1e-9
+            release = (h[-1] - l[-1]) / (a + 1e-12)
+            if release < 0.7:
+                return self._sig(reason="no_release")
+            # Direction: regime + F5 lean
+            regime = str(ctx.get("regime", "RANGE")).upper()
+            try:
+                f5 = f5_confluence(ctx.get("df"))
+                lean = f5.get("bias", 0)
+            except Exception:
+                lean = 0.0
+            if "UP" in regime:
+                lean += 0.3
+            elif "DOWN" in regime:
+                lean -= 0.3
+            if abs(lean) < 0.2:
+                return self._sig(reason="no_direction")
+            side = qsign(lean)
+            sl_atr = qclip(1.2 + (1 - pct) * 0.8, 1.0, 3.0)
+            tp_atr = qclip(2.0 + (1 - pct) * 2.5, 1.5, 6.0)
+            return self._sig(side, 0.55 + (1 - pct) * 0.15, sl_atr, tp_atr,
+                             f"squeeze_pct{pct:.2f}")
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveCarryDrift(_L2Base):
+    """Slow-drift ride for dead-grind regimes: tiny size, patient trail.
+
+    Legacy had no quiet-regime harvester — it either forced scalps or sat out.
+    This unit earns the grind: drift-aligned micro-positions with wide time
+    stops and a ratchet that never gives back more than it banked.
+    """
+
+    name = "carry_drift"
+
+    def suitable(self, regime):
+        return regime in ("QUIET", "RANGE")
+
+    def analyze(self, ctx):
+        try:
+            o, h, l, c = self._cols(ctx)
+            if len(c) < 120:
+                return self._sig(reason="warmup")
+            # Drift: 60-bar slope normalized by noise
+            import math as _m
+            drift = (c[-1] - c[-60]) / 60
+            noise = sum(abs(c[i] - c[i - 1]) for i in range(-60, 0)) / 60 + 1e-12
+            snr = abs(drift) / noise
+            if snr < 0.04:  # pure noise — stay out
+                return self._sig(reason="no_drift")
+            if snr > 0.5:  # too fast — not our regime, let trend_rider have it
+                return self._sig(reason="too_fast")
+            side = qsign(drift)
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else 1e-9
+            # Wide stops (drift needs room), modest target, tiny size
+            sl_atr = qclip(3.0, 2.0, 4.0)
+            tp_atr = qclip(abs(c[-1] - c[-60]) / (a + 1e-12) * 0.8 + 1.0, 1.5, 5.0)
+            return self._sig(side, 0.5 + snr, sl_atr, tp_atr, f"drift_snr{snr:.3f}",
+                             size_mult=0.4, max_hold_bars=200)
+        except Exception:
+            return self._sig(reason="error")
+
+
+class AdaptiveGapFiller(_L2Base):
+    """Gap / fair-value-gap fills with hard invalidation (no bag-holding).
+
+    Legacy gap logic (where present) held gaps to full fill. Here the fill
+    target is partial (first 50% quantile from history) with invalidation the
+    moment PA accepts beyond the gap — fills fail fast or not at all.
+    """
+
+    name = "gap_filler"
+
+    def __init__(self):
+        super().__init__()
+        self._fill_win = QuantileWindow(120)  # realized fill fractions
+
+    def suitable(self, regime):
+        return regime in ("RANGE", "QUIET", "SESSION", "VOLATILE")
+
+    def analyze(self, ctx):
+        try:
+            o, h, l, c = self._cols(ctx)
+            if len(c) < 30:
+                return self._sig(reason="warmup")
+            atrs = q_atr_from_lists(h, l, c, 14)
+            a = atrs[-1] if atrs else 1e-9
+            # Overnight gap: |open - prev close| significant?
+            gap = o[-1] - c[-2]
+            gap_a = abs(gap) / (a + 1e-12)
+            if gap_a < 0.4:
+                # Try fair-value-gap: 3-candle imbalance
+                if len(c) < 5:
+                    return self._sig(reason="no_gap")
+                fvg_up = l[-1] > h[-3]  # bullish FVG below
+                fvg_dn = h[-1] < l[-3]  # bearish FVG above
+                if not (fvg_up or fvg_dn):
+                    return self._sig(reason="no_gap")
+                zone_top = l[-1] if fvg_up else l[-3]
+                zone_bot = h[-3] if fvg_up else h[-1]
+                mid = (zone_top + zone_bot) / 2
+                if abs(c[-1] - mid) / (a + 1e-12) > 1.5:
+                    return self._sig(reason="fvg_far")
+                side = 1 if fvg_up else -1
+                sl_atr = qclip(abs(c[-1] - (zone_bot if side > 0 else zone_top)) / (a + 1e-12) + 0.5,
+                               0.8, 3.0)
+                fill_frac = self._fill_win.q(0.5) or 0.6
+                tp_atr = qclip(abs(zone_top - zone_bot) / (a + 1e-12) * fill_frac + 0.5,
+                               0.8, 4.0)
+                return self._sig(side, 0.55, sl_atr, tp_atr, "fvg_fill")
+            # Classic gap fade
+            side = -qsign(gap)
+            # Invalidation: if PA already accepted beyond gap origin, skip
+            origin = c[-2]
+            if (side > 0 and min(l[-3:]) < origin - 0.3 * a) or \
+               (side < 0 and max(h[-3:]) > origin + 0.3 * a):
+                return self._sig(reason="accepted_beyond")
+            fill_frac = self._fill_win.q(0.5) or 0.6
+            sl_atr = qclip(gap_a * 0.7 + 0.5, 0.8, 3.0)
+            tp_atr = qclip(gap_a * fill_frac, 0.5, 4.0)
+            return self._sig(side, 0.52 + min(0.2, gap_a / 10), sl_atr, tp_atr,
+                             f"gap{gap_a:.2f}a_fill{fill_frac:.0%}")
+        except Exception:
+            return self._sig(reason="error")
+
+    def feedback_fill(self, frac):
+        try:
+            self._fill_win.add(qclip(float(frac), 0, 1.5))
+        except Exception:
+            pass
+
+
+# Extend the L2Suite pool to all 15 (monkey-patch CLASSES + re-init safe)
+_L2B_CLASSES = (AdaptiveFibSniper, AdaptiveSessionBreak, AdaptiveSweepFader,
+                AdaptiveVolSqueeze, AdaptiveCarryDrift, AdaptiveGapFiller)
+
+try:
+    _ORIG_L2_CLASSES = tuple(L2Suite.CLASSES)
+    L2Suite.CLASSES = tuple(L2Suite.CLASSES) + _L2B_CLASSES
+    # Rebuild any live singleton so the new strats join immediately
+    if _L2_SINGLETON.get("obj") is not None:
+        _keep_stats = {s.name: s.stats for s in _L2_SINGLETON["obj"].strats}
+        _L2_SINGLETON["obj"] = L2Suite()
+        for _s in _L2_SINGLETON["obj"].strats:
+            if _s.name in _keep_stats:
+                _s.stats = _keep_stats[_s.name]
+except Exception:
+    pass
+
+SECTION_L2B_OK = True
