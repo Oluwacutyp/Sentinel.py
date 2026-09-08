@@ -1,0 +1,69 @@
+# Sentinel.py — default engine preset (balanced, multi-asset)
+engine:
+  equity: 100000.0
+  base_currency: USD
+  base_risk: 0.01
+  max_positions: 6
+  max_leverage: 1.0
+  timeframe: 1h
+  higher_timeframes: [4h, 1D]
+  seed: 42
+
+regime:
+  lookback: 200
+  trend_adx_like: 0.25
+  squeeze_quantile: 0.15
+  panic_vol_quantile: 0.95
+  min_bars: 120
+
+adaptive:
+  enabled: true
+  vol_window: 50
+  scale_min: 0.5
+  scale_max: 2.0
+  recalibrate_bars: 500
+
+signals:
+  min_agreement: 0.55
+  hysteresis: 0.08
+  pattern_boost: 0.10
+  pattern_veto: 0.85
+
+ml:
+  enabled: true
+  threshold: 0.55
+  retrain_bars: 2000
+  embargo_bars: 20
+  max_features: 64
+
+risk:
+  sizing: kelly_frac        # fixed | vol_target | kelly_frac | cppi
+  kelly_cap: 0.25
+  vol_target: 0.12
+  cppi_floor: 0.85
+  cppi_multiple: 3.0
+  stop_atr: 2.0
+  time_stop_bars: 120
+  breakeven_atr: 1.0
+  daily_halt: -0.03
+  max_drawdown: -0.15
+  max_correlation: 0.75
+  exposure_cap: 0.80
+
+costs:
+  fee_bps: 5
+  slippage_atr: 0.05
+  spread_bps: 2
+  funding_8h_bps: 1
+  latency_ms: 250
+
+backtest:
+  engine: event_driven      # vectorized | event_driven
+  warmup_bars: 300
+  cash: 100000.0
+
+live:
+  dry_run: true
+  poll_seconds: 20
+  error_budget: 5
+  panic_file: /tmp/sentinel_panic

@@ -1,0 +1,40 @@
+# Sentinel.py — forex preset (session-aware, leverage-capped, spread-sensitive)
+engine:
+  equity: 25000.0
+  base_currency: USD
+  base_risk: 0.005
+  max_positions: 5
+  max_leverage: 5.0
+  timeframe: 1h
+  higher_timeframes: [4h, 1D]
+  seed: 11
+
+regime:
+  lookback: 240
+  squeeze_quantile: 0.15
+  panic_vol_quantile: 0.95
+
+adaptive: { enabled: true, vol_window: 60, scale_min: 0.5, scale_max: 2.0, recalibrate_bars: 400 }
+signals: { min_agreement: 0.60, hysteresis: 0.08, pattern_boost: 0.08, pattern_veto: 0.90 }
+ml: { enabled: true, threshold: 0.57, retrain_bars: 2000, embargo_bars: 24, max_features: 48 }
+
+risk:
+  sizing: vol_target
+  vol_target: 0.08
+  kelly_cap: 0.15
+  stop_atr: 2.0
+  time_stop_bars: 72
+  breakeven_atr: 1.0
+  daily_halt: -0.02
+  max_drawdown: -0.10
+  max_correlation: 0.70
+  exposure_cap: 2.00
+
+sessions:
+  london_open: "08:00"
+  newyork_open: "13:00"
+  timezone: UTC
+
+costs: { fee_bps: 1, slippage_atr: 0.04, spread_bps: 2, funding_8h_bps: 0, latency_ms: 300 }
+backtest: { engine: event_driven, warmup_bars: 350, cash: 25000.0 }
+live: { dry_run: true, poll_seconds: 60, error_budget: 6, panic_file: /tmp/sentinel_panic }
