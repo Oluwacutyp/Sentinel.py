@@ -14,6 +14,30 @@
 // 8. float→int implicit conversions (color transparency, lengths) eliminated
 // 9. TP2+SL same-bar double exit race (if/if) → if/else-if exit ladder
 // 10. Dark pool levels now persist (var) instead of resetting each bar
+//
+// ── v16 TRAP INTELLIGENCE UPGRADE (real-desk behaviour) ───────────────────────
+// Philosophy: the market is an execution venue and brokers/market-makers get paid
+// per trade — someone profits when the crowd gets trapped, so the engine now
+// assumes every obvious level is a potential lure and trades AGAINST the trapped
+// side instead of joining it.
+// 11. BEYOND-FVG MODE — profitable desks do NOT play inside fair value gaps, they
+//     look beyond them: entries inside an un-reclaimed FVG are now blocked as
+//     bait; the real setup is the sweep THROUGH the gap + reclaim (or full
+//     reclaim in one bar). FVG touch scoring replaced with reclaim scoring.
+// 12. INVERTED FVG ENGINE — a bull FVG that closes below flips into supply, a
+//     bear FVG that closes above flips into demand (failed gaps = footprints of
+//     trapped traders). Tracked, drawn and scored.
+// 13. TRAP INTELLIGENCE — Swing Failure Patterns at engineered liquidity
+//     (EQH/EQL, Asian extremes, PD highs/lows), fake-breakout detection
+//     (close-break fails back inside within a hold window), low-volume breakout
+//     lure filter, and trap-memory biasing of the confluence engine.
+// 14. BROKER-COST GATE — round-trip spread+commission+slippage modelled in bps;
+//     trades whose TP1 cannot clear costs after risk are skipped (no feeding the
+//     broker), and the HUD shows the breakeven move per trade.
+// 15. Entry gates: bait/lure/cost suppression wired into the state machine,
+//     pending-signal logic, radar, HUD, narrative, alerts and entry labels.
+// 16. DAILY CIRCUIT BREAKER — realized-R daily loss cap + max trades/day.
+//     A profitable desk stops when the day is red instead of feeding the broker.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 //@version=6
@@ -41,6 +65,7 @@ string GRP_ALERT  = "━━━ ALERTS & WEBHOOKS ━━━"
 string GRP_LAYOUT = "━━━ LAYOUT (TABLE PLACEMENT) ━━━"
 string GRP_PATTERN = "━━━ PATTERN — H&S + ICHIMOKU ━━━"
 string GRP_ROUTE   = "━━━ STRATEGY ROUTER ━━━"
+string GRP_TRAP    = "━━━ TRAP INTELLIGENCE & BEYOND-FVG ━━━"
 
 // ── Visual Toggles ──
 bool showEmas      = input.bool(true,  "Show Trend EMAs",                   group=GRP_UI)
@@ -150,6 +175,9 @@ bool  moveBEat50       = input.bool(true, "Move to BE at 0.5R Gain",   group=GRP
 bool  useProfitLock    = input.bool(true, "Profit-Lock Trail (0.5R retrace)", group=GRP_RISK, tooltip="After +1.5R, locks profit if price retraces 0.5R from the peak")
 float beOffsetR        = input.float(0.10, "TP1 BE Lock Offset (R)", group=GRP_RISK, step=0.05, minval=0.0, tooltip="At TP1 the stop moves to entry + this many R (0 = plain BE)")
 bool  useSpikeShield   = input.bool(true, "Spike Shield (no entries on vol spikes)", group=GRP_RISK)
+bool  useCircuitBreaker = input.bool(true, "Circuit Breaker (daily loss + trade cap)", group=GRP_RISK, tooltip="Profitable traders stop when the day is red — overtrading and revenge entries are how accounts die. Halts new entries once the daily loss cap or the trade cap is hit; resets on a new day")
+float maxDailyLossR     = input.float(3.0, "Max Daily Loss (R)", group=GRP_RISK, step=0.5, minval=0.5, maxval=20.0, tooltip="Once the day's realized R drops below -this, the engine stands down until the next day")
+int   maxTradesDay      = input.int(4, "Max Trades Per Day", group=GRP_RISK, minval=1, maxval=20, tooltip="Commission is a certainty, edge is a probability — cap the number of times you pay it per day")
 
 // ── Strategy Router (dynamic playbook selection) ──
 bool  useRouter  = input.bool(true, "Enable Strategy Router", group=GRP_ROUTE, tooltip="ON: router picks the playbook per market state — MOMENTUM / MEAN-REV / POST-SPIKE / BREAKOUT / FLAT. OFF: legacy single-strategy score mode")
@@ -158,11 +186,26 @@ bool  alertOnMode = input.bool(false, "Alert on strategy-mode change", group=GRP
 bool  showGeoLines = input.bool(false, "Show geometry lines (support/resistance trendlines)", group=GRP_ROUTE, tooltip="Optional overlay of the detected trendlines. Off by default — the geometry drives decisions, not decoration")
 float spikeAtrMult     = input.float(2.2, "Spike Shield ATR Multiple", group=GRP_RISK, step=0.1, minval=1.0)
 
+// ── Trap Intelligence & Beyond-FVG (institutional behaviour layer) ──
+bool  useTrapEngine  = input.bool(true,  "Enable Trap Intelligence Engine", group=GRP_TRAP, tooltip="Brokers/market-makers get paid to execute — someone profits when the crowd is trapped. This engine detects stop-hunts, swing-failure patterns and fake breakouts, then biases entries AGAINST the trapped side instead of joining it")
+bool  useBeyondFvg   = input.bool(true,  "Beyond-FVG Mode (never enter INSIDE gaps)", group=GRP_TRAP, tooltip="Profitable desks don't play inside fair value gaps — they look beyond them. Longs inside an un-reclaimed bull FVG (and shorts inside a bear FVG) are blocked as bait; the real setup is the sweep THROUGH the gap followed by the reclaim back out of it")
+bool  useInvFvg      = input.bool(true,  "Trade Inverted FVGs (failed gaps flip)", group=GRP_TRAP, tooltip="A bull FVG that closes below flips into supply; a bear FVG that closes above flips into demand. Failed gaps are footprints of trapped traders — their exits become your entry zone")
+bool  blockSusBreak  = input.bool(true,  "Block Low-Volume Breakouts (lure filter)", group=GRP_TRAP, tooltip="Genuine breakouts attract genuine volume. A break of structure on below-average volume is usually a lure engineered to trap breakout traders — entries on that bar are refused unless a trap-fade setup is already active")
+bool  showTraps      = input.bool(true,  "Show Trap / Reclaim / iFVG Labels", group=GRP_TRAP)
+int   trapMemoryBars = input.int(12,    "Trap Memory (bars)", group=GRP_TRAP, minval=3, maxval=60, tooltip="How many bars a sprung trap keeps biasing confluence and gating entries")
+int   brkLookback    = input.int(6,     "Fake-Breakout Hold Window (bars)", group=GRP_TRAP, minval=2, maxval=20, tooltip="If a close-break of a swing fails back inside within this many bars, the breakout is declared a trap")
+float trapVolMult    = input.float(1.15, "SFP Volume Confirm (× SMA)", group=GRP_TRAP, step=0.05, minval=0.8, maxval=3.0, tooltip="Swing-failure pattern must carry at least this multiple of average volume to count as a real liquidity raid")
+int   maxInvFvgs     = input.int(4,      "Max Active Inverted FVGs", group=GRP_TRAP, minval=1, maxval=8)
+float costBps        = input.float(4.0,  "Round-Trip Cost (bps: spread+comm+slip)", group=GRP_TRAP, step=0.5, minval=0.0, tooltip="Total cost per round trip in basis points. Brokers earn on every fill — a setup that cannot clear its own costs is skipped")
+bool  useCostGate    = input.bool(true,  "Cost Gate (skip trades TP1 can't cover)", group=GRP_TRAP)
+float minNetRR       = input.float(0.6,  "Min Net TP1 R After Costs", group=GRP_TRAP, step=0.1, minval=0.0, maxval=3.0, tooltip="TP1 distance minus round-trip costs must be at least this many R, otherwise the trade exists only to pay commission")
+
 // ── Alerts ──
 bool alertOnSignal = input.bool(true, "Alert: New Setup Signal",  group=GRP_ALERT)
 bool alertOnEntry  = input.bool(true, "Alert: Order Execution",   group=GRP_ALERT)
 bool alertOnZone   = input.bool(true, "Alert: Zone Entry/Tap",    group=GRP_ALERT)
 bool alertOnExit   = input.bool(true, "Alert: TP / BE / SL Exit", group=GRP_ALERT)
+bool alertOnTrap   = input.bool(true, "Alert: Trap / Beyond-FVG Event", group=GRP_ALERT)
 
 // ── Layout — dynamic table placement ──
 string hudPos      = input.string("bottom_right", "Execution HUD Position",    options=["bottom_right", "bottom_left", "top_right", "top_left"], group=GRP_LAYOUT)
@@ -1234,6 +1277,20 @@ var array<bool>  rFvgOk  = array.new<bool>()
 var array<box>   rFvgBox = array.new<box>()
 var array<float> rFvgStr = array.new<float>()
 
+// ── Inverted FVG zones — failed gaps flip polarity (trapped-side footprints) ──
+var array<float> ifvgSupH   = array.new<float>()   // failed bull gaps → supply
+var array<float> ifvgSupL   = array.new<float>()
+var array<int>   ifvgSupBar = array.new<int>()
+var array<bool>  ifvgSupOk  = array.new<bool>()
+var array<box>   ifvgSupBox = array.new<box>()
+var array<float> ifvgDemH   = array.new<float>()   // failed bear gaps → demand
+var array<float> ifvgDemL   = array.new<float>()
+var array<int>   ifvgDemBar = array.new<int>()
+var array<bool>  ifvgDemOk  = array.new<bool>()
+var array<box>   ifvgDemBox = array.new<box>()
+bool ifvgFlipSupEv = false
+bool ifvgFlipDemEv = false
+
 var array<float> rbsH    = array.new<float>()
 var array<float> rbsL    = array.new<float>()
 var array<bool>  rbsOk   = array.new<bool>()
@@ -1467,10 +1524,27 @@ if array.size(bFvgH) > 0
                 box.set_right(array.get(bFvgBox, i), bar_index + 40)
             if low <= t and close >= b
                 bFvgHit := true
-            if close < b or (bar_index - cb) > zoneMaxAge
+            bool bFvgFailed = close < b
+            if bFvgFailed or (bar_index - cb) > zoneMaxAge
                 array.set(bFvgOk, i, false)
                 if showFVG and i < array.size(bFvgBox)
                     box.set_bgcolor(array.get(bFvgBox, i), color.new(color.gray, 94))
+                // FAILED bull gap flips into supply — the trapped longs inside become exit liquidity
+                if useInvFvg and bFvgFailed
+                    ifvgFlipSupEv := true
+                    if array.size(ifvgSupH) >= maxInvFvgs
+                        if array.size(ifvgSupBox) > 0
+                            box.delete(array.shift(ifvgSupBox))
+                        array.shift(ifvgSupH)
+                        array.shift(ifvgSupL)
+                        array.shift(ifvgSupBar)
+                        array.shift(ifvgSupOk)
+                    array.push(ifvgSupH, t)
+                    array.push(ifvgSupL, b)
+                    array.push(ifvgSupBar, bar_index)
+                    array.push(ifvgSupOk, true)
+                    if showTraps
+                        array.push(ifvgSupBox, box.new(bar_index, t, bar_index + 40, b, border_color=color.new(color.orange, 35), bgcolor=color.new(color.orange, 86), border_style=line.style_dashed))
             float d = math.abs(close - t)
             if d < bFvgMinDist
                 bFvgMinDist := d
@@ -1491,10 +1565,27 @@ if array.size(rFvgH) > 0
                 box.set_right(array.get(rFvgBox, i), bar_index + 40)
             if high >= b and close <= t
                 rFvgHit := true
-            if close > t or (bar_index - cb) > zoneMaxAge
+            bool rFvgFailed = close > t
+            if rFvgFailed or (bar_index - cb) > zoneMaxAge
                 array.set(rFvgOk, i, false)
                 if showFVG and i < array.size(rFvgBox)
                     box.set_bgcolor(array.get(rFvgBox, i), color.new(color.gray, 94))
+                // FAILED bear gap flips into demand — the trapped shorts inside become exit liquidity
+                if useInvFvg and rFvgFailed
+                    ifvgFlipDemEv := true
+                    if array.size(ifvgDemH) >= maxInvFvgs
+                        if array.size(ifvgDemBox) > 0
+                            box.delete(array.shift(ifvgDemBox))
+                        array.shift(ifvgDemH)
+                        array.shift(ifvgDemL)
+                        array.shift(ifvgDemBar)
+                        array.shift(ifvgDemOk)
+                    array.push(ifvgDemH, t)
+                    array.push(ifvgDemL, b)
+                    array.push(ifvgDemBar, bar_index)
+                    array.push(ifvgDemOk, true)
+                    if showTraps
+                        array.push(ifvgDemBox, box.new(bar_index, t, bar_index + 40, b, border_color=color.new(color.aqua, 35), bgcolor=color.new(color.aqua, 86), border_style=line.style_dashed))
             float d = math.abs(close - t)
             if d < rFvgMinDist
                 rFvgMinDist := d
@@ -1550,6 +1641,231 @@ if showQuantum
     drawFieldForZone(rObH, rObL, rObOk, rObStr, color.red)
     drawFieldForZone(bFvgH, bFvgL, bFvgOk, bFvgStr, color.teal)
     drawFieldForZone(rFvgH, rFvgL, rFvgOk, rFvgStr, color.fuchsia)
+
+// ╔═══════════════════════════════════════════════════════════════════╗
+// ║  SECTION 16B: TRAP INTELLIGENCE — BEYOND-FVG & MARKET-MAKER LURES ║
+// ║  Brokers exist to execute and collect commission — someone who     ║
+// ║  profits off your order flow wants you trapped. This engine:       ║
+// ║  1. Detects swing-failure stop hunts at engineered liquidity       ║
+// ║  2. Flags fake breakouts (close-break that fails back inside)      ║
+// ║  3. Never plays INSIDE an FVG — waits for the sweep THROUGH the    ║
+// ║     gap and the reclaim beyond it (or trades the inverted gap)     ║
+// ║  4. Turns every sprung trap into confluence for the opposite side  ║
+// ╚═══════════════════════════════════════════════════════════════════╝
+
+// ── 1) Swing Failure Pattern — wick through liquidity + reclaim close ──
+bool bullTrapNow = useTrapEngine and not na(lastPH) and high > lastPH and close < lastPH and close < open and volume > volSma * trapVolMult
+bool bearTrapNow = useTrapEngine and not na(lastPL) and low  < lastPL and close > lastPL and close > open and volume > volSma * trapVolMult
+
+// Engineered liquidity: raids at EQH/EQL, Asian extremes or PD highs/lows are the highest-probability traps
+float trpProx = atr * 0.35
+bool bullTrapEng = bullTrapNow and ((isEQH and math.abs(lastPH - eqhLevel) <= trpProx) or (not na(asianHigh) and math.abs(high - asianHigh) <= trpProx) or (not na(pdHigh) and math.abs(high - pdHigh) <= trpProx) or (not na(pwHigh) and math.abs(high - pwHigh) <= trpProx))
+bool bearTrapEng = bearTrapNow and ((isEQL and math.abs(lastPL - eqlLevel) <= trpProx) or (not na(asianLow) and math.abs(low - asianLow) <= trpProx) or (not na(pdLow) and math.abs(low - pdLow) <= trpProx) or (not na(pwLow) and math.abs(low - pwLow) <= trpProx))
+
+var int  bullTrapBar    = na   // bar the bulls got trapped (fade → short bias)
+var bool bullTrapWasEng = false
+var int  bearTrapBar    = na   // bar the bears got trapped (fade → long bias)
+var bool bearTrapWasEng = false
+if bullTrapNow
+    bullTrapBar := bar_index
+    bullTrapWasEng := bullTrapEng
+if bearTrapNow
+    bearTrapBar := bar_index
+    bearTrapWasEng := bearTrapEng
+bool bullTrapActive = not na(bullTrapBar) and bar_index - bullTrapBar <= trapMemoryBars
+bool bearTrapActive = not na(bearTrapBar) and bar_index - bearTrapBar <= trapMemoryBars
+
+// ── 2) Fake-breakout state machine — close-break that fails back inside ──
+var int   brkUpBar = na
+var float brkUpLvl = na
+var int   brkDnBar = na
+var float brkDnLvl = na
+bool brkUpNow = useTrapEngine and not na(lastPH) and close > lastPH and close[1] <= lastPH
+bool brkDnNow = useTrapEngine and not na(lastPL) and close < lastPL and close[1] >= lastPL
+// Lure: a break of structure on below-average volume — real money doesn't hide
+bool brkUpSus = brkUpNow and volume < volSma
+bool brkDnSus = brkDnNow and volume < volSma
+if brkUpNow
+    brkUpBar := bar_index
+    brkUpLvl := lastPH
+if brkDnNow
+    brkDnBar := bar_index
+    brkDnLvl := lastPL
+bool fakeBrkUp = false
+bool fakeBrkDn = false
+if not na(brkUpBar) and bar_index - brkUpBar <= brkLookback and close < nz(brkUpLvl, close)
+    fakeBrkUp := true
+    brkUpBar := na
+    bullTrapBar := bar_index
+    bullTrapWasEng := bullTrapWasEng or bullTrapEng
+if not na(brkDnBar) and bar_index - brkDnBar <= brkLookback and close > nz(brkDnLvl, close)
+    fakeBrkDn := true
+    brkDnBar := na
+    bearTrapBar := bar_index
+    bearTrapWasEng := bearTrapWasEng or bearTrapEng
+if not na(brkUpBar) and bar_index - brkUpBar > brkLookback
+    brkUpBar := na
+if not na(brkDnBar) and bar_index - brkDnBar > brkLookback
+    brkDnBar := na
+
+// ── 3) BEYOND THE GAP — the real trade lives past the FVG, not inside it ──
+// State machine per side: 0 = none · 1 = gap swept (price closed through it,
+// crowd chasing inside) · 2 = reclaimed back out (the crowd is now trapped).
+var int   bfgState       = 0
+var float bfgBot         = na
+var float bfgTop         = na
+var int   bfgBar         = na
+var bool  bfgReclaimFull = false
+bool bfgSweepEv   = false
+bool bfgReclaimEv = false
+if useBeyondFvg and array.size(bFvgH) > 0
+    for i = 0 to array.size(bFvgH) - 1
+        float t = array.get(bFvgH, i)
+        float b = array.get(bFvgL, i)
+        int   zb = array.get(bFvgBar, i)
+        bool fresh = bar_index - zb <= zoneMaxAge
+        if fresh
+            if bfgState == 0 and low < b and close > b
+                // one-bar raid straight through the gap and back — strongest reclaim
+                bfgState := 2
+                bfgBot := b
+                bfgTop := t
+                bfgBar := bar_index
+                bfgReclaimFull := close > t
+                bfgSweepEv := true
+                bfgReclaimEv := true
+            else if bfgState == 0 and close < b
+                bfgState := 1
+                bfgBot := b
+                bfgTop := t
+                bfgBar := bar_index
+                bfgReclaimFull := false
+                bfgSweepEv := true
+            else if bfgState == 1 and close > bfgBot
+                bfgState := 2
+                bfgBar := bar_index
+                bfgReclaimFull := close > bfgTop
+                bfgReclaimEv := true
+if bfgState > 0 and not na(bfgBar) and bar_index - bfgBar > trapMemoryBars
+    bfgState := 0
+
+var int   rfgState       = 0
+var float rfgTop         = na
+var float rfgBot         = na
+var int   rfgBar         = na
+var bool  rfgReclaimFull = false
+bool rfgSweepEv   = false
+bool rfgReclaimEv = false
+if useBeyondFvg and array.size(rFvgH) > 0
+    for i = 0 to array.size(rFvgH) - 1
+        float t = array.get(rFvgH, i)
+        float b = array.get(rFvgL, i)
+        int   zb = array.get(rFvgBar, i)
+        bool fresh = bar_index - zb <= zoneMaxAge
+        if fresh
+            if rfgState == 0 and high > t and close < t
+                rfgState := 2
+                rfgTop := t
+                rfgBot := b
+                rfgBar := bar_index
+                rfgReclaimFull := close < b
+                rfgSweepEv := true
+                rfgReclaimEv := true
+            else if rfgState == 0 and close > t
+                rfgState := 1
+                rfgTop := t
+                rfgBot := b
+                rfgBar := bar_index
+                rfgReclaimFull := false
+                rfgSweepEv := true
+            else if rfgState == 1 and close < rfgTop
+                rfgState := 2
+                rfgBar := bar_index
+                rfgReclaimFull := close < rfgBot
+                rfgReclaimEv := true
+if rfgState > 0 and not na(rfgBar) and bar_index - rfgBar > trapMemoryBars
+    rfgState := 0
+
+// ── 4) Inside-the-gap bait flag — price parked INSIDE an un-reclaimed gap ──
+bool insideBullFvg = false
+bool insideBearFvg = false
+if useBeyondFvg
+    if array.size(bFvgH) > 0
+        for i = 0 to array.size(bFvgH) - 1
+            if array.get(bFvgOk, i)
+                float t = array.get(bFvgH, i)
+                float b = array.get(bFvgL, i)
+                if close >= b and close <= t
+                    insideBullFvg := true
+    if array.size(rFvgH) > 0
+        for i = 0 to array.size(rFvgH) - 1
+            if array.get(rFvgOk, i)
+                float t = array.get(rFvgH, i)
+                float b = array.get(rFvgL, i)
+                if close >= b and close <= t
+                    insideBearFvg := true
+bool baitLong  = useBeyondFvg and insideBullFvg and bfgState != 2
+bool baitShort = useBeyondFvg and insideBearFvg and rfgState != 2
+
+// ── 5) Inverted-FVG tests — failed gaps defending their new polarity ──
+bool  ifvgSupTest = false
+float ifvgSupLvl  = na
+if useInvFvg and array.size(ifvgSupH) > 0
+    for i = 0 to array.size(ifvgSupH) - 1
+        if array.get(ifvgSupOk, i)
+            float t = array.get(ifvgSupH, i)
+            float b = array.get(ifvgSupL, i)
+            int   zb = array.get(ifvgSupBar, i)
+            if showTraps and i < array.size(ifvgSupBox)
+                box.set_right(array.get(ifvgSupBox, i), bar_index + 40)
+            if high >= b and close <= t and close <= open
+                ifvgSupTest := true
+                ifvgSupLvl := t
+            if close > t or bar_index - zb > zoneMaxAge
+                array.set(ifvgSupOk, i, false)
+                if showTraps and i < array.size(ifvgSupBox)
+                    box.set_bgcolor(array.get(ifvgSupBox, i), color.new(color.gray, 94))
+
+bool  ifvgDemTest = false
+float ifvgDemLvl  = na
+if useInvFvg and array.size(ifvgDemH) > 0
+    for i = 0 to array.size(ifvgDemH) - 1
+        if array.get(ifvgDemOk, i)
+            float t = array.get(ifvgDemH, i)
+            float b = array.get(ifvgDemL, i)
+            int   zb = array.get(ifvgDemBar, i)
+            if showTraps and i < array.size(ifvgDemBox)
+                box.set_right(array.get(ifvgDemBox, i), bar_index + 40)
+            if low <= t and close >= b and close >= open
+                ifvgDemTest := true
+                ifvgDemLvl := b
+            if close < b or bar_index - zb > zoneMaxAge
+                array.set(ifvgDemOk, i, false)
+                if showTraps and i < array.size(ifvgDemBox)
+                    box.set_bgcolor(array.get(ifvgDemBox, i), color.new(color.gray, 94))
+
+// ── 6) Trap chart labels ──
+if showTraps and barstate.isconfirmed
+    if bullTrapNow
+        label.new(bar_index, high + atr * 0.7, bullTrapEng ? "🪤 BULL TRAP (engineered)" : "🪤 BULL TRAP", color=color.new(color.red, 5), textcolor=color.white, style=label.style_label_down, size=size.small)
+    if bearTrapNow
+        label.new(bar_index, low - atr * 0.7, bearTrapEng ? "🪤 BEAR TRAP (engineered)" : "🪤 BEAR TRAP", color=color.new(color.green, 5), textcolor=color.white, style=label.style_label_up, size=size.small)
+    if fakeBrkUp
+        label.new(bar_index, high + atr * 0.4, "FAKE BREAK ↑", color=color.new(color.red, 30), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+    if fakeBrkDn
+        label.new(bar_index, low - atr * 0.4, "FAKE BREAK ↓", color=color.new(color.green, 30), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+    if bfgSweepEv and not bfgReclaimEv
+        label.new(bar_index, low - atr * 0.5, "🕳️ GAP RAID", color=color.new(color.orange, 15), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+    if rfgSweepEv and not rfgReclaimEv
+        label.new(bar_index, high + atr * 0.5, "🕳️ GAP RAID", color=color.new(color.orange, 15), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+    if bfgReclaimEv
+        label.new(bar_index, low - atr * 0.5, bfgReclaimFull ? "🌊 BEYOND GAP ↑ FULL" : "🌊 BEYOND GAP ↑", color=color.new(color.teal, 5), textcolor=color.white, style=label.style_label_up, size=size.small)
+    if rfgReclaimEv
+        label.new(bar_index, high + atr * 0.5, rfgReclaimFull ? "🌊 BEYOND GAP ↓ FULL" : "🌊 BEYOND GAP ↓", color=color.new(color.fuchsia, 5), textcolor=color.white, style=label.style_label_down, size=size.small)
+    if ifvgFlipSupEv
+        label.new(bar_index, high + atr * 0.3, "🔄 iFVG SUPPLY", color=color.new(color.orange, 40), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+    if ifvgFlipDemEv
+        label.new(bar_index, low - atr * 0.3, "🔄 iFVG DEMAND", color=color.new(color.aqua, 40), textcolor=color.white, style=label.style_label_up, size=size.tiny)
 
 // ╔═══════════════════════════════════════════════════════════════════╗
 // ║     SECTION 17: ASOC SELF-OPTIMIZATION & DYNAMIC THRESHOLD       ║
@@ -1709,17 +2025,46 @@ if rObHit or rObZoneGravity > 0.4
     sellScore += qBonus
     sellWhy := sellWhy == "Awaiting Setup..." ? (rObCoreTap ? "Bear OB Core Tap" : "Bear OB Gravity") : sellWhy + " + OB"
 
-// 6b. FVG hits (max 10)
-if bFvgHit and inDiscount
-    buyScore += 10.0
-    buyWhy := buyWhy == "Awaiting Setup..." ? "Bull FVG" : buyWhy + " + FVG"
-else if bFvgHit
-    buyScore += 6.0
-if rFvgHit and inPremium
-    sellScore += 10.0
-    sellWhy := sellWhy == "Awaiting Setup..." ? "Bear FVG" : sellWhy + " + FVG"
-else if rFvgHit
-    sellScore += 6.0
+// 6b. FVG intelligence (max 15) — amateurs chase INSIDE gaps; pros play BEYOND them.
+// Beyond-FVG ON: sweeping through the gap (trapping the crowd inside) and
+// reclaiming back out is the setup. Sitting inside an un-reclaimed gap is bait.
+if useBeyondFvg
+    if bfgState == 2
+        buyScore += bfgReclaimFull ? 15.0 : 11.0
+        buyWhy := buyWhy == "Awaiting Setup..." ? (bfgReclaimFull ? "Beyond-FVG Full Reclaim 🌊" : "Beyond-FVG Reclaim 🌊") : buyWhy + " + GapReclaim"
+    else if baitLong
+        buyScore -= 8.0
+    if rfgState == 2
+        sellScore += rfgReclaimFull ? 15.0 : 11.0
+        sellWhy := sellWhy == "Awaiting Setup..." ? (rfgReclaimFull ? "Beyond-FVG Full Reclaim 🌊" : "Beyond-FVG Reclaim 🌊") : sellWhy + " + GapReclaim"
+    else if baitShort
+        sellScore -= 8.0
+else
+    if bFvgHit and inDiscount
+        buyScore += 10.0
+        buyWhy := buyWhy == "Awaiting Setup..." ? "Bull FVG" : buyWhy + " + FVG"
+    else if bFvgHit
+        buyScore += 6.0
+    if rFvgHit and inPremium
+        sellScore += 10.0
+        sellWhy := sellWhy == "Awaiting Setup..." ? "Bear FVG" : sellWhy + " + FVG"
+    else if rFvgHit
+        sellScore += 6.0
+
+// 6c. TRAP FADE (max 15) — the crowd that got trapped becomes our liquidity
+if useTrapEngine
+    if bearTrapActive
+        buyScore += bearTrapWasEng ? 15.0 : 10.0
+        buyWhy := buyWhy == "Awaiting Setup..." ? "Bear Trap Sprung 🪤" : buyWhy + " + TrapFade"
+    if bullTrapActive
+        sellScore += bullTrapWasEng ? 15.0 : 10.0
+        sellWhy := sellWhy == "Awaiting Setup..." ? "Bull Trap Sprung 🪤" : sellWhy + " + TrapFade"
+    if ifvgDemTest
+        buyScore += 6.0
+        buyWhy := buyWhy == "Awaiting Setup..." ? "Inverted FVG Demand 🔄" : buyWhy + " + iFVG"
+    if ifvgSupTest
+        sellScore += 6.0
+        sellWhy := sellWhy == "Awaiting Setup..." ? "Inverted FVG Supply 🔄" : sellWhy + " + iFVG"
 
 // 7. Breaker blocks (max 10)
 if rbsHit and inDiscount
@@ -1916,7 +2261,9 @@ if validBuySweep
     buyFactors += 1
 if bObHit or bObZoneGravity > 0.4
     buyFactors += 1
-if bFvgHit
+if bFvgHit and not baitLong
+    buyFactors += 1
+if useTrapEngine and (bearTrapActive or ifvgDemTest or (useBeyondFvg and bfgState == 2))
     buyFactors += 1
 if rbsHit
     buyFactors += 1
@@ -1984,7 +2331,9 @@ if validSellSweep
     sellFactors += 1
 if rObHit or rObZoneGravity > 0.4
     sellFactors += 1
-if rFvgHit
+if rFvgHit and not baitShort
+    sellFactors += 1
+if useTrapEngine and (bullTrapActive or ifvgSupTest or (useBeyondFvg and rfgState == 2))
     sellFactors += 1
 if sbrHit
     sellFactors += 1
@@ -2269,6 +2618,19 @@ if isAsia
 bool asiaValid      = isGoldWeekday and not na(asiaHi) and asiaHi > asiaLo
 bool asiaBreakLong  = asiaValid and isLondon and close > asiaHi and close[1] <= asiaHi and volume > volSma
 bool asiaBreakShort = asiaValid and isLondon and close < asiaLo and close[1] >= asiaLo and volume > volSma
+
+// ── TRADER DISCIPLINE — daily circuit breaker (loss cap & trade cap) ──
+// Counters are updated in the accounting block after the exit ladder; the halt
+// computed here takes effect from the next entry decision (real desks stop,
+// they don't revenge-trade). Resets on a new trading day.
+var int   cbDay       = 1
+var float dayR        = 0.0
+var int   tradesToday = 0
+if dNow != cbDay
+    cbDay := dNow
+    dayR := 0.0
+    tradesToday := 0
+bool cbHalt = useCircuitBreaker and (dayR <= -math.abs(maxDailyLossR) or tradesToday >= maxTradesDay)
 
 // Optional geometry overlay (off by default)
 var line geoSupL = na
@@ -2557,7 +2919,22 @@ float modeThreshB = math.max(math.min(buyThresh + modeOff + f_modeThreshAdj(mode
 float modeThreshS = math.max(math.min(sellThresh + modeOff + f_modeThreshAdj(mode), 95.0), 50.0)
 var float posRunAtr = 1.2
 
-if tradeState == 0 and barstate.isconfirmed and volOk and sessionOk and canTrade
+// ── BROKER-COST GATE — the desk that pays commission must clear it first ──
+float costPx     = close * costBps / 10000.0
+float pSlLong    = math.max(recentSwingLow - atr * dynSlBuf * symSlBuf, close - atr * modeCap)
+float pRiskLong  = math.max(close - pSlLong, 0.0)
+float pSlShort   = math.min(recentSwingHigh + atr * dynSlBuf * symSlBuf, close + atr * modeCap)
+float pRiskShort = math.max(pSlShort - close, 0.0)
+bool costOkLong  = true
+bool costOkShort = true
+if useCostGate
+    costOkLong  := pRiskLong  >= costPx * 2.0 and tp1RR - costPx / math.max(pRiskLong, 1e-9) >= minNetRR
+    costOkShort := pRiskShort >= costPx * 2.0 and tp1RR - costPx / math.max(pRiskShort, 1e-9) >= minNetRR
+// ── LURE GATE — don't chase a low-volume break that exists to trap you ──
+bool lureLong  = useTrapEngine and blockSusBreak and brkUpSus and not bearTrapActive
+bool lureShort = useTrapEngine and blockSusBreak and brkDnSus and not bullTrapActive
+
+if tradeState == 0 and barstate.isconfirmed and volOk and sessionOk and canTrade and not cbHalt
     bool modeOpen  = useRouter ? mode > M_FLAT : true
     bool playLong  = useRouter ? f_modeSignal(mode, true) : true
     bool playShort = useRouter ? f_modeSignal(mode, false) : true
@@ -2569,6 +2946,12 @@ if tradeState == 0 and barstate.isconfirmed and volOk and sessionOk and canTrade
             buyOk := false
         if isCounterBiasSell
             sellOk := false
+    // Don't be someone else's exit liquidity: no entries inside bait gaps,
+    // on low-volume lure breaks, or on trades that only exist to pay the broker
+    if baitLong or lureLong or not costOkLong
+        buyOk := false
+    if baitShort or lureShort or not costOkShort
+        sellOk := false
     if buyOk and (not sellOk or buyScore >= sellScore + 5.0)
         goLong := true
     else if sellOk and (not buyOk or sellScore >= buyScore + 5.0)
@@ -2607,8 +2990,13 @@ if goLong
     string grNote = "\n[" + getGrade(buyScore, buyThresh) + "]"
     string cbNote = isCounterBiasBuy ? "\n⚡ Counter-Bias" : ""
     string tp3Str = usePVS ? "\nTP3: " + str.tostring(tp3Px, "#.##") : ""
+    string trapTag = ""
+    if useBeyondFvg and bfgState == 2
+        trapTag := "\n🌊 BEYOND-FVG RECLAIM ENTRY"
+    else if useTrapEngine and bearTrapActive
+        trapTag := "\n🪤 TRAP-FADE ENTRY"
     label.new(bar_index, slPx - atr * 1.5,
-        text="🟢 LONG\nUnits: " + str.tostring(posUnits, "#.##") + "\nEntry: " + str.tostring(entryPx, "#.##") + "\nSL: " + str.tostring(slPx, "#.##") + "\nTP1: " + str.tostring(tp1Px, "#.##") + "\nTP2: " + str.tostring(tp2Px, "#.##") + tp3Str + "\n" + buyWhy + grNote + cbNote + "\nScore: " + str.tostring(buyScore, "#") + "%\n🧭 " + modeName,
+        text="🟢 LONG\nUnits: " + str.tostring(posUnits, "#.##") + "\nEntry: " + str.tostring(entryPx, "#.##") + "\nSL: " + str.tostring(slPx, "#.##") + "\nTP1: " + str.tostring(tp1Px, "#.##") + "\nTP2: " + str.tostring(tp2Px, "#.##") + tp3Str + "\n" + buyWhy + grNote + cbNote + trapTag + "\nScore: " + str.tostring(buyScore, "#") + "%\n🧭 " + modeName,
         color=color.rgb(8, 38, 18), textcolor=color.white, style=label.style_label_up, size=size.normal)
     if alertOnEntry
         alert("🟢 LONG | " + syminfo.ticker + (isCounterBiasBuy ? " ⚡COUNTER" : "") + " | Entry: " + str.tostring(entryPx, "#.##") + " | Units: " + str.tostring(posUnits, "#.##") + " | " + buyWhy, alert.freq_once_per_bar)
@@ -2646,8 +3034,13 @@ if goShort
     string grNote = "\n[" + getGrade(sellScore, sellThresh) + "]"
     string cbNote = isCounterBiasSell ? "\n⚡ Counter-Bias" : ""
     string tp3Str = usePVS ? "\nTP3: " + str.tostring(tp3Px, "#.##") : ""
+    string trapTag = ""
+    if useBeyondFvg and rfgState == 2
+        trapTag := "\n🌊 BEYOND-FVG RECLAIM ENTRY"
+    else if useTrapEngine and bullTrapActive
+        trapTag := "\n🪤 TRAP-FADE ENTRY"
     label.new(bar_index, slPx + atr * 1.5,
-        text="🔴 SHORT\nUnits: " + str.tostring(posUnits, "#.##") + "\nEntry: " + str.tostring(entryPx, "#.##") + "\nSL: " + str.tostring(slPx, "#.##") + "\nTP1: " + str.tostring(tp1Px, "#.##") + "\nTP2: " + str.tostring(tp2Px, "#.##") + tp3Str + "\n" + sellWhy + grNote + cbNote + "\nScore: " + str.tostring(sellScore, "#") + "%\n🧭 " + modeName,
+        text="🔴 SHORT\nUnits: " + str.tostring(posUnits, "#.##") + "\nEntry: " + str.tostring(entryPx, "#.##") + "\nSL: " + str.tostring(slPx, "#.##") + "\nTP1: " + str.tostring(tp1Px, "#.##") + "\nTP2: " + str.tostring(tp2Px, "#.##") + tp3Str + "\n" + sellWhy + grNote + cbNote + trapTag + "\nScore: " + str.tostring(sellScore, "#") + "%\n🧭 " + modeName,
         color=color.rgb(38, 8, 8), textcolor=color.white, style=label.style_label_down, size=size.normal)
     if alertOnEntry
         alert("🔴 SHORT | " + syminfo.ticker + (isCounterBiasSell ? " ⚡COUNTER" : "") + " | Entry: " + str.tostring(entryPx, "#.##") + " | Units: " + str.tostring(posUnits, "#.##") + " | " + sellWhy, alert.freq_once_per_bar)
@@ -2887,9 +3280,17 @@ if tradeState == -1 and barstate.isconfirmed
             if alertOnExit
                 alert(exitNote + " | " + syminfo.ticker + " SHORT @ " + str.tostring(close, "#.##"), alert.freq_once_per_bar)
 
-// ── Pending signals (post-state-machine) ──
-bool pendingBuy  = modeAL and buyScore >= modeThreshB and buyGateOk and not spikeBlocked and tradeState == 0 and volOk and sessionOk and canTrade
-bool pendingSell = modeAS and sellScore >= modeThreshS and sellGateOk and not spikeBlocked and tradeState == 0 and volOk and sessionOk and canTrade
+// ── Trader discipline accounting — runs after every exit ladder pass ──
+if tradeState[1] == 0 and tradeState != 0
+    tradesToday += 1
+if tradeState[1] != 0 and tradeState == 0
+    float rkDenom = math.max(nz(riskR, 0.0), 1e-9)
+    float exitR = tradeState[1] == 1 ? (close - entryPx) / rkDenom : (entryPx - close) / rkDenom
+    dayR += exitR
+
+// ── Pending signals (post-state-machine, trap & cost gates respected) ──
+bool pendingBuy  = modeAL and buyScore >= modeThreshB and buyGateOk and not spikeBlocked and tradeState == 0 and volOk and sessionOk and canTrade and not baitLong and not lureLong and costOkLong and not cbHalt
+bool pendingSell = modeAS and sellScore >= modeThreshS and sellGateOk and not spikeBlocked and tradeState == 0 and volOk and sessionOk and canTrade and not baitShort and not lureShort and costOkShort and not cbHalt
 
 // ╔═══════════════════════════════════════════════════════════════════╗
 // ║     SECTION 20: SIGNAL & ZONE ALERTS                             ║
@@ -2906,6 +3307,29 @@ if alertOnZone and tradeState == 0 and barstate.isconfirmed
         alert("📍 BUY ZONE | " + syminfo.ticker, alert.freq_once_per_bar)
     if rObHit or rFvgHit or sbrHit
         alert("📍 SELL ZONE | " + syminfo.ticker, alert.freq_once_per_bar)
+
+// ── Trap Intelligence & Beyond-FVG events ──
+if alertOnTrap and barstate.isconfirmed
+    if bullTrapNow
+        alert("🪤 BULL TRAP — highs raided & rejected" + (bullTrapEng ? " (engineered liquidity)" : "") + " | " + syminfo.ticker + " → short bias", alert.freq_once_per_bar)
+    if bearTrapNow
+        alert("🪤 BEAR TRAP — lows raided & rejected" + (bearTrapEng ? " (engineered liquidity)" : "") + " | " + syminfo.ticker + " → long bias", alert.freq_once_per_bar)
+    if fakeBrkUp
+        alert("🪤 FAKE BREAKOUT FAILED (upside) | " + syminfo.ticker + " → short bias", alert.freq_once_per_bar)
+    if fakeBrkDn
+        alert("🪤 FAKE BREAKOUT FAILED (downside) | " + syminfo.ticker + " → long bias", alert.freq_once_per_bar)
+    if bfgSweepEv and not bfgReclaimEv
+        alert("🕳️ BULL FVG RAIDED — crowd chasing inside the gap | " + syminfo.ticker + " | wait for reclaim, trade BEYOND the gap", alert.freq_once_per_bar)
+    if rfgSweepEv and not rfgReclaimEv
+        alert("🕳️ BEAR FVG RAIDED — crowd chasing inside the gap | " + syminfo.ticker + " | wait for reclaim, trade BEYOND the gap", alert.freq_once_per_bar)
+    if bfgReclaimEv
+        alert("🌊 BEYOND-FVG RECLAIM ↑ | " + syminfo.ticker + (bfgReclaimFull ? " (FULL reclaim)" : "") + " → long bias", alert.freq_once_per_bar)
+    if rfgReclaimEv
+        alert("🌊 BEYOND-FVG RECLAIM ↓ | " + syminfo.ticker + (rfgReclaimFull ? " (FULL reclaim)" : "") + " → short bias", alert.freq_once_per_bar)
+    if ifvgFlipSupEv
+        alert("🔄 FVG INVERTED → new SUPPLY zone | " + syminfo.ticker, alert.freq_once_per_bar)
+    if ifvgFlipDemEv
+        alert("🔄 FVG INVERTED → new DEMAND zone | " + syminfo.ticker, alert.freq_once_per_bar)
 
 // ╔═══════════════════════════════════════════════════════════════════╗
 // ║     SECTION 21: S&R CLUSTER WEIGHT ENGINE                        ║
@@ -2987,7 +3411,7 @@ f_drawHud() =>
         if na(execHUD) or hudPos != hudPosUsed
             if not na(execHUD)
                 table.delete(execHUD)
-            execHUD := table.new(f_pos(hudPos), 2, 26, border_width=1, border_color=color.new(color.gray, 65), frame_color=color.new(color.gray, 55), frame_width=1)
+            execHUD := table.new(f_pos(hudPos), 2, 28, border_width=1, border_color=color.new(color.gray, 65), frame_color=color.new(color.gray, 55), frame_width=1)
             hudPosUsed := hudPos
 
         if barstate.islast
@@ -3041,7 +3465,7 @@ f_drawHud() =>
                 sessionStr := "🟣 Asian (00-07)"
                 sessionCol := color.new(color.purple, 60)
 
-            string cautionStr = cautionMode ? "⚠ CAUTION MODE" : spikeBlocked ? "🛡 SPIKE SHIELD" : (useBtcWeekend and btcWeekend) ? "🌙 THIN (BTC WE)" : "✅ Normal"
+            string cautionStr = cbHalt ? "⛔ CIRCUIT BREAKER" : cautionMode ? "⚠ CAUTION MODE" : spikeBlocked ? "🛡 SPIKE SHIELD" : (useBtcWeekend and btcWeekend) ? "🌙 THIN (BTC WE)" : "✅ Normal"
 
             string macroHudStr = "N/A"
             color macroHudCol = color.rgb(22, 22, 22)
@@ -3191,6 +3615,45 @@ f_drawHud() =>
             table.cell(execHUD, 0, 25, "Vol Value (VWAP)", bgcolor=DR, text_color=LC, text_size=size.small)
             table.cell(execHUD, 1, 25, valueStr, bgcolor=MR, text_color=TC, text_size=size.small)
 
+            string trapStr = useTrapEngine ? "None" : "Engine Off"
+            color trapCol = MR
+            if useTrapEngine
+                if bullTrapActive and bearTrapActive
+                    trapStr := "⚔ BOTH TRAPS SPRUNG"
+                    trapCol := color.new(color.orange, 40)
+                else if bullTrapActive
+                    trapStr := "🪤 BULLS TRAPPED → fade longs" + (bullTrapWasEng ? " (engineered)" : "")
+                    trapCol := color.new(color.red, 45)
+                else if bearTrapActive
+                    trapStr := "🪤 BEARS TRAPPED → fade shorts" + (bearTrapWasEng ? " (engineered)" : "")
+                    trapCol := color.new(color.green, 45)
+                else if useBeyondFvg and bfgState == 2
+                    trapStr := "🌊 GAP RECLAIMED ↑ beyond-FVG"
+                    trapCol := color.new(color.teal, 45)
+                else if useBeyondFvg and rfgState == 2
+                    trapStr := "🌊 GAP RECLAIMED ↓ beyond-FVG"
+                    trapCol := color.new(color.fuchsia, 45)
+                else if baitLong or baitShort
+                    trapStr := baitLong ? "⚠ INSIDE BULL FVG — BAIT, wait" : "⚠ INSIDE BEAR FVG — BAIT, wait"
+                    trapCol := color.new(color.orange, 35)
+                else if brkUpSus or brkDnSus
+                    trapStr := brkUpSus ? "🎣 LOW-VOL BREAK ↑ — lure watch" : "🎣 LOW-VOL BREAK ↓ — lure watch"
+                    trapCol := color.new(color.orange, 55)
+            string costStr = "Cost gate off"
+            color costCol = MR
+            if useCostGate
+                string gateL = costOkLong ? "✅" : "⛔"
+                string gateS = costOkShort ? "✅" : "⛔"
+                costStr := "BE move " + str.tostring(costPx, "#.####") + " | L:" + gateL + " S:" + gateS + " | " + str.tostring(costBps, "#.#") + "bps RT"
+                costCol := costOkLong or costOkShort ? MR : color.new(color.red, 40)
+            costStr := costStr + " | Day " + str.tostring(dayR, "#.##") + "R · " + str.tostring(tradesToday, "#") + "/" + str.tostring(maxTradesDay, "#") + " trades"
+            if cbHalt
+                costCol := color.new(color.red, 40)
+            table.cell(execHUD, 0, 26, "Trap Intelligence 🪤", bgcolor=DR, text_color=LC, text_size=size.small)
+            table.cell(execHUD, 1, 26, trapStr, bgcolor=trapCol, text_color=TC, text_size=size.small)
+            table.cell(execHUD, 0, 27, "Broker Economics 💰", bgcolor=DR, text_color=LC, text_size=size.small)
+            table.cell(execHUD, 1, 27, costStr, bgcolor=costCol, text_color=TC, text_size=size.small)
+
 f_drawHud()
 
 // ╔═══════════════════════════════════════════════════════════════════╗
@@ -3204,7 +3667,7 @@ f_drawRadar() =>
         if na(radarTbl) or radarPos != radarPosUsed
             if not na(radarTbl)
                 table.delete(radarTbl)
-            radarTbl := table.new(f_pos(radarPos), 2, 13, border_width=1, border_color=color.new(color.gray, 65), frame_color=color.new(color.gray, 55), frame_width=1)
+            radarTbl := table.new(f_pos(radarPos), 2, 14, border_width=1, border_color=color.new(color.gray, 65), frame_color=color.new(color.gray, 55), frame_width=1)
             radarPosUsed := radarPos
         if barstate.islast
             f_radar_row(radarTbl, 0, "━━ CONFLUENCE RADAR ━━", "━━ " + symbolMode + " ━━", true)
@@ -3220,6 +3683,28 @@ f_drawRadar() =>
             f_radar_row(radarTbl, 10, "Score vs Threshold", (buyScore >= dynThreshold or sellScore >= dynThreshold) ? "EXECUTE" : "WAIT", buyScore >= dynThreshold or sellScore >= dynThreshold)
             f_radar_row(radarTbl, 11, "Ichimoku (Daily)", dayKumoState, not na(dayKumoTop))
             f_radar_row(radarTbl, 12, "H&S Pattern", hsT_state == 3 ? "TOP BROKEN ✖" : hsB_state == 3 ? "BOTTOM BROKEN ✔" : hsT_state >= 1 or hsB_state >= 1 ? "Forming" : hsD_Tst == 3 ? "DAILY TOP ✖" : hsD_Bst == 3 ? "DAILY BOTTOM ✔" : "None", hsT_state >= 1 or hsB_state >= 1 or hsD_Tst >= 1 or hsD_Bst >= 1)
+            string trapRadarStr = useTrapEngine ? "None" : "Engine Off"
+            bool   trapRadarHot = false
+            if useTrapEngine
+                if bullTrapActive and bearTrapActive
+                    trapRadarStr := "⚔ BOTH SPRUNG"
+                    trapRadarHot := true
+                else if bullTrapActive
+                    trapRadarStr := "Bulls Trapped → Short"
+                    trapRadarHot := true
+                else if bearTrapActive
+                    trapRadarStr := "Bears Trapped → Long"
+                    trapRadarHot := true
+                else if useBeyondFvg and bfgState == 2
+                    trapRadarStr := bfgReclaimFull ? "Full Gap Reclaim ↑" : "Gap Reclaim ↑"
+                    trapRadarHot := true
+                else if useBeyondFvg and rfgState == 2
+                    trapRadarStr := rfgReclaimFull ? "Full Gap Reclaim ↓" : "Gap Reclaim ↓"
+                    trapRadarHot := true
+                else if baitLong or baitShort
+                    trapRadarStr := baitLong ? "Inside Bull FVG — BAIT" : "Inside Bear FVG — BAIT"
+                    trapRadarHot := true
+            f_radar_row(radarTbl, 13, "Trap Intelligence 🪤", trapRadarStr, trapRadarHot)
 
 f_drawRadar()
 
@@ -3651,7 +4136,9 @@ f_drawNarrative() =>
             narrative := narrative + " · 🚀 SHORT " + (close <= entryPx ? "+" : "") + rStr + " · " + (tp1Done ? (slPx < entryPx ? "BE + Profit Lock" : "BE Locked") : "En Route") + (convSoft ? " · ⚠ Soft Invalidation" : "") + (isCounterBias ? " · ⚡ C-Bias" : "") + " · " + catalyst
         else
             string ctx = "Equilibrium"
-            if cautionMode
+            if cbHalt
+                ctx := "⛔ CIRCUIT BREAKER — day done (" + str.tostring(dayR, "#.##") + "R), protect capital"
+            else if cautionMode
                 ctx := "⚠ " + (isNfpDay ? "NFP Day" : "London Fix")
             else if spikeBlocked
                 ctx := "🛡 Spike Shield"
@@ -3669,6 +4156,18 @@ f_drawNarrative() =>
                 ctx := "🌏 ASIA RANGE BREAK ↓"
             else if useHs and ((hsT_state == 3 and bar_index - hsT_broke <= 5) or (hsB_state == 3 and bar_index - hsB_broke <= 5))
                 ctx := "⚠ H&S " + (hsT_state == 3 ? "TOP BROKEN" : "BOTTOM BROKEN")
+            else if useTrapEngine and bullTrapActive and bearTrapActive
+                ctx := "⚔ TRAPS BOTH SIDES — thin edge, stand down"
+            else if useTrapEngine and bullTrapActive
+                ctx := "🪤 BULL TRAP SPRUNG — fade the breakout"
+            else if useTrapEngine and bearTrapActive
+                ctx := "🪤 BEAR TRAP SPRUNG — fade the breakdown"
+            else if useBeyondFvg and bfgState == 2
+                ctx := "🌊 BEYOND-FVG reclaim ↑ — longs past the gap"
+            else if useBeyondFvg and rfgState == 2
+                ctx := "🌊 BEYOND-FVG reclaim ↓ — shorts past the gap"
+            else if baitLong or baitShort
+                ctx := baitLong ? "⚠ Inside bull FVG — bait zone, wait for the sweep" : "⚠ Inside bear FVG — bait zone, wait for the sweep"
             else if pendingBuy
                 ctx := "🟢 BUY READY " + str.tostring(buyScore, "#") + "% · " + buyWhy
             else if pendingSell
